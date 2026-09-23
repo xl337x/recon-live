@@ -1,0 +1,1498 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Recon Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  color-scheme: dark;
+  --bg:#12141a; --panel:#191c24; --panel2:#1f232d; --inset:#0e1015;
+  --line:#2b303c; --line2:#3a4150;
+  --text:#e6e8ee; --muted:#8b93a7; --faint:#5b6376;
+  --amber:#e8a13a; --amber-dim:#7a5a1e;
+  --teal:#39bdae; --teal-dim:#1d5a54;
+  --warn:#e5484d; --ok:#3fb950;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:"Space Grotesk",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  --pad-top: env(safe-area-inset-top,0px);
+  --pad-bot: env(safe-area-inset-bottom,0px);
+  box-sizing:border-box;
+}
+:root[data-theme="light"]{
+  color-scheme: light;
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#f0f2f6; --inset:#f7f8fb;
+  --line:#e2e6ec; --line2:#cfd5df;
+  --text:#1a1d24; --muted:#5c6472; --faint:#98a0af;
+  --amber:#b9791a; --amber-dim:#e7c07a;
+  --teal:#0f8579; --teal-dim:#a9ded8;
+  --warn:#c62a2f; --ok:#1f883d;
+}
+*{box-sizing:inherit}
+html,body{margin:0}
+html{scroll-padding-top:var(--pad-top)}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:var(--sans); font-size:15px; line-height:1.45;
+  padding-top:var(--pad-top); padding-bottom:var(--pad-bot);
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--teal)}
+
+/* ---- header ---- */
+header{
+  display:flex; align-items:center; gap:14px;
+  padding:16px clamp(16px,4vw,32px);
+  border-bottom:1px solid var(--line);
+  position:sticky; top:var(--pad-top); z-index:20;
+  background:color-mix(in srgb,var(--bg) 92%,transparent);
+  backdrop-filter:saturate(1.2) blur(8px);
+}
+.brand{display:flex; align-items:baseline; gap:10px; margin-right:auto}
+.brand .mark{
+  font-family:var(--mono); font-weight:600; letter-spacing:-.5px;
+  font-size:20px; color:var(--text);
+}
+.brand .mark b{color:var(--amber); font-weight:700}
+.brand .sub{font-size:12.5px; color:var(--faint); font-family:var(--mono)}
+.hbtn{
+  font:inherit; font-size:13px; cursor:pointer;
+  background:var(--panel2); color:var(--muted);
+  border:1px solid var(--line); border-radius:8px; padding:7px 12px;
+}
+.hbtn:hover{color:var(--text); border-color:var(--line2)}
+.hbtn.armed{background:color-mix(in srgb,var(--warn) 18%,var(--panel2)); color:var(--warn); border-color:var(--warn); font-weight:600}
+/* keyboard focus visibility */
+:focus-visible{outline:2px solid var(--amber); outline-offset:2px; border-radius:6px}
+input:focus-visible,select:focus-visible,textarea:focus-visible{outline-offset:-1px}
+/* collapsible groups */
+.group > h2{cursor:pointer; user-select:none}
+.group > h2::after{content:"▾"; margin-left:auto; color:var(--faint); font-size:11px; transition:transform .12s}
+.group.collapsed > h2::after{content:"▸"}
+.group.collapsed > :not(h2){display:none !important}
+
+/* ---- layout ---- */
+main{
+  display:grid; grid-template-columns: minmax(340px,1fr) minmax(420px,1.15fr);
+  gap:1px; background:var(--line);
+  min-height: calc(100dvh - 64px - var(--pad-top));
+}
+.controls{background:var(--bg); padding:clamp(16px,3vw,26px); overflow:auto}
+.output{background:var(--bg); border-left:0}
+@media (max-width:900px){
+  main{grid-template-columns:1fr}
+  .output{border-top:1px solid var(--line)}
+  .console-wrap{position:static !important; height:auto !important}
+}
+
+/* ---- control groups ---- */
+.group{margin-bottom:26px}
+.group > h2{
+  margin:0 0 12px; font-size:12.5px; font-weight:600; color:var(--muted);
+  font-family:var(--mono); letter-spacing:.3px;
+  display:flex; align-items:center; gap:8px;
+}
+.group > h2 .idx{
+  width:20px; height:20px; flex:none; display:grid; place-items:center;
+  border:1px solid var(--line2); border-radius:6px; color:var(--amber);
+  font-size:11px; font-weight:600;
+}
+.field{margin-bottom:14px}
+label.fl{display:block; font-size:13px; color:var(--muted); margin-bottom:6px}
+input[type=text]{
+  width:100%; font-family:var(--mono); font-size:14px;
+  background:var(--inset); color:var(--text);
+  border:1px solid var(--line); border-radius:9px; padding:11px 12px;
+}
+input[type=text]:focus{outline:2px solid var(--amber); outline-offset:-1px; border-color:transparent}
+input[type=text]::placeholder{color:var(--faint)}
+textarea{
+  width:100%; font-family:var(--mono); font-size:13px; line-height:1.5; resize:vertical; min-height:64px;
+  background:var(--inset); color:var(--text);
+  border:1px solid var(--line); border-radius:9px; padding:11px 12px;
+}
+textarea:focus{outline:2px solid var(--amber); outline-offset:-1px; border-color:transparent}
+textarea::placeholder{color:var(--faint)}
+.hint{font-size:12px; color:var(--faint); margin-top:6px; font-family:var(--mono)}
+
+/* target readout */
+.readout{
+  margin-top:10px; display:none; gap:8px 16px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:12.5px;
+}
+.readout.on{display:flex}
+.readout span b{color:var(--teal); font-weight:500}
+.readout span.warn b{color:var(--warn)}
+
+/* profile pills */
+.pills{display:flex; gap:8px; flex-wrap:wrap}
+.pill{
+  flex:1 1 0; min-width:88px; cursor:pointer; text-align:center;
+  background:var(--panel); border:1px solid var(--line); border-radius:10px;
+  padding:10px 8px; transition:border-color .12s,background .12s;
+}
+.pill .t{font-size:13.5px; font-weight:600}
+.pill .d{font-size:11px; color:var(--faint); font-family:var(--mono); margin-top:2px}
+.pill[aria-pressed=true]{border-color:var(--amber); background:color-mix(in srgb,var(--amber) 12%,var(--panel))}
+.pill[aria-pressed=true] .t{color:var(--amber)}
+
+/* toggles / checks */
+.checks{display:grid; grid-template-columns:1fr 1fr; gap:8px}
+.chk{
+  display:flex; align-items:center; gap:9px; cursor:pointer;
+  background:var(--panel); border:1px solid var(--line); border-radius:9px;
+  padding:9px 11px; font-size:13.5px; font-family:var(--mono);
+}
+.chk:hover{border-color:var(--line2)}
+.chk input{appearance:none; width:16px; height:16px; flex:none; border-radius:4px;
+  border:1.5px solid var(--line2); background:var(--inset); cursor:pointer; position:relative}
+.chk input:checked{background:var(--teal); border-color:var(--teal)}
+.chk input:checked::after{content:"";position:absolute;left:4px;top:1px;width:4px;height:8px;
+  border:solid var(--inset);border-width:0 2px 2px 0;transform:rotate(45deg)}
+.chk.amber input:checked{background:var(--amber); border-color:var(--amber)}
+.chk .note{color:var(--faint); font-size:11px; margin-left:auto}
+
+.row2{display:grid; grid-template-columns:1fr 1fr; gap:12px}
+.row3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px}
+select{
+  width:100%; font-family:var(--mono); font-size:13.5px;
+  background:var(--inset); color:var(--text);
+  border:1px solid var(--line); border-radius:9px; padding:10px 11px;
+}
+select:focus{outline:2px solid var(--amber); outline-offset:-1px}
+
+/* warnings */
+.alerts{display:flex; flex-direction:column; gap:8px; margin-top:4px}
+.alert{
+  display:flex; gap:9px; align-items:flex-start; font-size:12.5px;
+  border-radius:9px; padding:9px 11px; font-family:var(--mono); line-height:1.4;
+}
+.alert.w{background:color-mix(in srgb,var(--warn) 12%,transparent); color:var(--warn); border:1px solid color-mix(in srgb,var(--warn) 35%,transparent)}
+.alert.i{background:var(--panel); color:var(--muted); border:1px solid var(--line)}
+.alert .ic{font-weight:700; flex:none}
+
+/* ---- console ---- */
+.console-wrap{position:sticky; top:calc(64px + var(--pad-top)); height:calc(100dvh - 64px - var(--pad-top)); display:flex; flex-direction:column}
+.tabs{display:flex; gap:2px; padding:12px clamp(14px,2.5vw,22px) 0; border-bottom:1px solid var(--line)}
+.tab{
+  font:inherit; font-size:13px; font-family:var(--mono); cursor:pointer;
+  background:transparent; color:var(--muted); border:0; border-bottom:2px solid transparent;
+  padding:9px 12px; margin-bottom:-1px;
+}
+.tab:hover{color:var(--text)}
+.tab[aria-selected=true]{color:var(--amber); border-bottom-color:var(--amber)}
+.tab .dot{display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--teal); margin-left:6px; vertical-align:middle; opacity:0}
+.tab.has .dot{opacity:1}
+
+.console{flex:1; overflow:auto; padding:clamp(14px,2.5vw,22px); display:none}
+.console.on{display:block}
+.stage{margin-bottom:20px}
+.stage:last-child{margin-bottom:0}
+.stage h3{
+  margin:0 0 8px; font-size:12px; font-family:var(--mono); color:var(--muted);
+  font-weight:500; display:flex; align-items:center; gap:8px;
+}
+.stage h3 .n{color:var(--faint)}
+.codebox{position:relative; background:var(--inset); border:1px solid var(--line); border-radius:10px}
+.codebox pre{
+  margin:0; padding:14px 15px; overflow-x:auto;
+  font-family:var(--mono); font-size:13px; line-height:1.65; color:var(--text);
+  white-space:pre; tab-size:2;
+}
+.codebox pre .cm{color:var(--faint)}
+.codebox pre .fl{color:var(--teal)}
+.codebox pre .kw{color:var(--amber)}
+.copy{
+  position:absolute; top:8px; right:8px; z-index:2;
+  font:inherit; font-size:11.5px; font-family:var(--mono); cursor:pointer;
+  background:var(--panel2); color:var(--muted); border:1px solid var(--line);
+  border-radius:7px; padding:5px 9px;
+}
+.copy:hover{color:var(--text); border-color:var(--line2)}
+.copy.done{color:var(--ok); border-color:var(--ok)}
+
+.empty{color:var(--faint); font-family:var(--mono); font-size:13px; text-align:center; padding:48px 12px}
+
+.bar{
+  display:flex; gap:10px; padding:12px clamp(14px,2.5vw,22px);
+  border-top:1px solid var(--line); background:var(--panel);
+}
+.bar button{
+  flex:1; font:inherit; font-size:13.5px; font-weight:600; cursor:pointer;
+  border-radius:9px; padding:11px; border:1px solid var(--line);
+}
+.bar .primary{background:var(--amber); color:#161616; border-color:var(--amber)}
+.bar .primary:hover{filter:brightness(1.06)}
+.bar .ghost{background:transparent; color:var(--muted)}
+.bar .ghost:hover{color:var(--text); border-color:var(--line2)}
+.bar .primary.done{background:var(--ok); border-color:var(--ok); color:#0a0a0a}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="mark">recon<b>·</b>console</span>
+    <span class="sub">subdomains &rarr; live &rarr; ferox</span>
+  </div>
+  <button class="hbtn" id="depsBtn" type="button" title="Preflight installs missing tools automatically">Deps: check</button>
+  <button class="hbtn" id="armBtn" type="button" title="Gate intrusive brute/fuzz/exploit stages">Active: off</button>
+  <button class="hbtn" id="exportBtn" type="button" title="Save this config as JSON (no secrets)">Export</button>
+  <button class="hbtn" id="importBtn" type="button" title="Load a saved config JSON">Import</button>
+  <input type="file" id="importFile" accept="application/json,.json" style="display:none">
+  <button class="hbtn" id="themeBtn" type="button">Light</button>
+  <button class="hbtn" id="resetBtn" type="button">Reset</button>
+</header>
+
+<main>
+  <!-- ============ CONTROLS ============ -->
+  <section class="controls">
+
+    <div class="group">
+      <h2><span class="idx">1</span> Target</h2>
+      <div class="field">
+        <input type="text" id="target" placeholder="example.com  |  https://sub.example.com/path  |  10.0.0.5" autocomplete="off" spellcheck="false">
+        <div class="hint">Scheme, port, path and www. are stripped automatically.</div>
+        <div class="readout" id="readout"></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">2</span> Speed profile</h2>
+      <div class="pills" id="profiles">
+        <button class="pill" data-profile="stealth" type="button"><div class="t">Stealth</div><div class="d">10t · 20/s</div></button>
+        <button class="pill" data-profile="balanced" type="button" aria-pressed="true"><div class="t">Balanced</div><div class="d">40t · 100/s</div></button>
+        <button class="pill" data-profile="aggressive" type="button"><div class="t">Aggressive</div><div class="d">100t · off</div></button>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">3</span> Subdomain enumeration</h2>
+      <div class="checks" id="enumTools">
+        <label class="chk"><input type="checkbox" data-tool="subfinder" checked> subfinder</label>
+        <label class="chk"><input type="checkbox" data-tool="assetfinder" checked> assetfinder</label>
+        <label class="chk"><input type="checkbox" data-tool="amass"> amass (passive)</label>
+        <label class="chk"><input type="checkbox" data-tool="findomain"> findomain</label>
+        <label class="chk"><input type="checkbox" data-tool="chaos"> chaos <span class="note">API key</span></label>
+        <label class="chk"><input type="checkbox" data-tool="crtsh"> crt.sh</label>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">4</span> Resolve &amp; liveness (dnsx)</h2>
+      <div class="checks">
+        <label class="chk"><input type="checkbox" id="rx_on" checked> resolve first <span class="note">dnsx</span></label>
+        <label class="chk"><input type="checkbox" id="rx_wild" checked> strip wildcard DNS</label>
+        <label class="chk"><input type="checkbox" id="rx_dedupe" checked> fold www. duplicates</label>
+        <label class="chk"><input type="checkbox" id="rx_cname"> keep CNAME chain</label>
+      </div>
+      <div class="hint">Only names with a live DNS record reach httpx &mdash; cuts probe/brute noise dramatically.</div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">5</span> Live probe (httpx)</h2>
+      <div class="checks">
+        <label class="chk"><input type="checkbox" id="px_sc" checked> status-code</label>
+        <label class="chk"><input type="checkbox" id="px_title" checked> title</label>
+        <label class="chk"><input type="checkbox" id="px_td" checked> tech-detect</label>
+        <label class="chk"><input type="checkbox" id="px_fr" checked> follow-redirects</label>
+        <label class="chk"><input type="checkbox" id="px_ip"> resolve IP</label>
+        <label class="chk"><input type="checkbox" id="px_cdn"> flag CDN</label>
+        <label class="chk amber"><input type="checkbox" id="px_nuclei"> nuclei on live <span class="note">test</span></label>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">6</span> Directory brute (feroxbuster)</h2>
+      <div class="field">
+        <label class="fl">Wordlist</label>
+        <select id="wl">
+          <option value="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt">raft-medium-directories</option>
+          <option value="/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt">raft-large-directories</option>
+          <option value="/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt">dirlist-2.3-medium</option>
+          <option value="/usr/share/seclists/Discovery/Web-Content/common.txt">common.txt</option>
+          <option value="__custom__">custom path…</option>
+        </select>
+      </div>
+      <div class="field" id="wlCustomWrap" style="display:none">
+        <input type="text" id="wlCustom" placeholder="/path/to/wordlist.txt" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="fl">Extensions preset</label>
+        <select id="extPreset">
+          <option value="php,html,txt,js,json,bak">Generic</option>
+          <option value="php,txt,html,bak,old,zip,inc">PHP / WordPress</option>
+          <option value="aspx,asmx,ashx,asp,config,txt">ASP.NET / IIS</option>
+          <option value="jsp,do,action,xml,txt">Java</option>
+          <option value="json,xml">API / minimal</option>
+          <option value="">None</option>
+          <option value="__custom__">custom…</option>
+        </select>
+      </div>
+      <div class="field" id="extCustomWrap" style="display:none">
+        <input type="text" id="extCustom" placeholder="php,txt,bak" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="row3">
+        <div class="field"><label class="fl">Threads</label><input type="text" id="ferThreads" value="40"></div>
+        <div class="field"><label class="fl">Rate/s</label><input type="text" id="ferRate" value="100"></div>
+        <div class="field"><label class="fl">Depth</label><input type="text" id="ferDepth" value="2"></div>
+      </div>
+      <div class="field">
+        <label class="fl">Filter status codes (-C)</label>
+        <input type="text" id="ferFilterCodes" value="404,403" placeholder="404,403,500" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="checks">
+        <label class="chk amber"><input type="checkbox" id="fer_k" checked> -k insecure</label>
+        <label class="chk amber"><input type="checkbox" id="fer_norecur"> no recursion</label>
+        <label class="chk amber"><input type="checkbox" id="fer_redirects"> follow redirects</label>
+        <label class="chk amber"><input type="checkbox" id="fer_rua"> random UA</label>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">7</span> Parameter discovery</h2>
+      <div class="checks" id="discTools">
+        <label class="chk"><input type="checkbox" data-dtool="waymore" checked> waymore <span class="note">superset</span></label>
+        <label class="chk amber"><input type="checkbox" data-dtool="waymoreResp"> +responses <span class="note">slow</span></label>
+        <label class="chk"><input type="checkbox" data-dtool="gau"> gau</label>
+        <label class="chk"><input type="checkbox" data-dtool="wayback" checked> waybackurls</label>
+        <label class="chk"><input type="checkbox" data-dtool="paramspider"> paramspider</label>
+        <label class="chk"><input type="checkbox" data-dtool="katana" checked> katana <span class="note">crawl+JS</span></label>
+        <label class="chk"><input type="checkbox" data-dtool="xnlink" checked> JS params <span class="note">xnLinkFinder</span></label>
+        <label class="chk amber"><input type="checkbox" data-dtool="arjun" checked> arjun <span class="note">gap-fill</span></label>
+        <label class="chk amber"><input type="checkbox" data-dtool="x8"> x8 <span class="note">fast brute</span></label>
+        <label class="chk"><input type="checkbox" data-dtool="gf" checked> gf classify <span class="note">→ test</span></label>
+      </div>
+      <div class="row3" style="margin-top:12px">
+        <div class="field"><label class="fl">katana depth</label><input type="text" id="dDepth" value="3"></div>
+        <div class="field"><label class="fl">arjun max EPs</label><input type="text" id="dCap" value="25"></div>
+        <div class="field"><label class="fl">waymore -l</label><input type="text" id="dWmLimit" value="200"></div>
+      </div>
+      <div class="field">
+        <label class="fl">"Interesting endpoint" filter (regex)</label>
+        <input type="text" id="dInterest" value="login|search|api/|admin|upload|account|user|token|redirect|url=|file=|id=" autocomplete="off" spellcheck="false">
+        <div class="hint">arjun runs only on endpoints matching this — targeted, not blind.</div>
+      </div>
+      <div class="field">
+        <label class="fl">gf bug-class patterns</label>
+        <input type="text" id="dGfPats" value="lfi xss redirect ssrf sqli ssti rce idor" autocomplete="off" spellcheck="false">
+        <div class="hint">Buckets each class, then hands it to the matching test (dalfox / sqlmap / httpx probes).</div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">8</span> Parameters &amp; traversal</h2>
+      <div class="field">
+        <label class="fl">Parameter test URL <span class="note" style="color:var(--faint)">FUZZ marks the inject point</span></label>
+        <input type="text" id="pUrl" placeholder="https://fpx.com/?s=FUZZ" autocomplete="off" spellcheck="false">
+        <div class="hint">Leave blank to harvest parameterised URLs from live.txt instead.</div>
+      </div>
+      <div class="checks" id="paramTools">
+        <label class="chk"><input type="checkbox" data-ptool="harvest" checked> harvest (gau/qsreplace)</label>
+        <label class="chk"><input type="checkbox" data-ptool="arjun" checked> arjun discover</label>
+        <label class="chk"><input type="checkbox" data-ptool="ffuf"> ffuf value-fuzz</label>
+        <label class="chk amber"><input type="checkbox" data-ptool="ddpwn" checked> dotdotpwn traversal</label>
+        <label class="chk"><input type="checkbox" data-ptool="kxss"> kxss reflection</label>
+        <label class="chk"><input type="checkbox" data-ptool="nuclei"> nuclei fuzz</label>
+      </div>
+      <div class="field" style="margin-top:12px">
+        <label class="fl">Value payload list (ffuf / nuclei)</label>
+        <select id="pWl">
+          <option value="/usr/share/seclists/Fuzzing/LFI/LFI-gracefulsecurity-linux.txt">LFI · graceful-linux</option>
+          <option value="/usr/share/seclists/Fuzzing/XSS/XSS-Jhaddix.txt">XSS · Jhaddix</option>
+          <option value="/usr/share/seclists/Fuzzing/SQLi/Generic-SQLi.txt">SQLi · generic</option>
+          <option value="/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt">param names (arjun/ffuf)</option>
+          <option value="__custom__">custom path…</option>
+        </select>
+      </div>
+      <div class="field" id="pWlCustomWrap" style="display:none">
+        <input type="text" id="pWlCustom" placeholder="/path/to/payloads.txt" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="row2">
+        <div class="field"><label class="fl">dotdotpwn: grab file</label><input type="text" id="pFile" value="/etc/passwd"></div>
+        <div class="field"><label class="fl">dotdotpwn: match</label><input type="text" id="pMatch" value="root:"></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2><span class="idx">A</span> Auth / session <span class="note" style="color:var(--faint)">flows to every authed tool</span></h2>
+      <div class="field">
+        <label class="fl">Import from browser <span class="note" style="color:var(--faint)">paste cURL / raw request</span></label>
+        <textarea id="authImport" placeholder="DevTools ▸ Network ▸ right-click a request ▸ Copy ▸ Copy as cURL  —  then paste here&#10;(or Burp ▸ right-click ▸ Copy request)"></textarea>
+        <div class="row2" style="margin-top:8px">
+          <button class="hbtn" id="authImportBtn" type="button" style="flex:1">Parse &amp; fill</button>
+          <button class="hbtn" id="authClearBtn" type="button" style="flex:1">Clear auth</button>
+        </div>
+        <div class="hint" id="authImportMsg">Extracts the Cookie + all headers automatically — no manual hunting.</div>
+      </div>
+      <div class="field">
+        <label class="fl">Cookie</label>
+        <input type="text" id="authCookie" placeholder="session=abc123; token=xyz" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="fl">Headers <span class="note" style="color:var(--faint)">one per line</span></label>
+        <textarea id="authHeaders" placeholder="Authorization: Bearer eyJ...&#10;X-Api-Key: ...&#10;User-Agent: Mozilla/5.0" spellcheck="false"></textarea>
+      </div>
+      <div class="field">
+        <label class="fl">Proxy export for xnLinkFinder <span class="note" style="color:var(--faint)">Burp / ZAP / HAR</span></label>
+        <input type="text" id="authBurp" placeholder="/path/to/authenticated-traffic.xml" autocomplete="off" spellcheck="false">
+        <div class="hint">Browse the app logged-in through your proxy, export, and point here — xnLinkFinder pulls authenticated endpoints + params from it.</div>
+      </div>
+    </div>
+
+    <div class="group" style="margin-bottom:8px">
+      <h2><span class="idx">!</span> Checks</h2>
+      <div class="alerts" id="alerts"></div>
+    </div>
+
+  </section>
+
+  <!-- ============ OUTPUT ============ -->
+  <section class="output">
+    <div class="console-wrap">
+      <div class="tabs" id="tabs" role="tablist">
+        <button class="tab" role="tab" data-panel="setup" aria-selected="false">Setup<span class="dot"></span></button>
+        <button class="tab" role="tab" data-panel="enum" aria-selected="false">Enum<span class="dot"></span></button>
+        <button class="tab" role="tab" data-panel="probe" aria-selected="false">Probe<span class="dot"></span></button>
+        <button class="tab" role="tab" data-panel="ferox" aria-selected="false">Ferox<span class="dot"></span></button>
+        <button class="tab" role="tab" data-panel="discover" aria-selected="false">Discover<span class="dot"></span></button>
+        <button class="tab" role="tab" data-panel="params" aria-selected="false">Params<span class="dot"></span></button>
+        <button class="tab" role="tab" data-panel="full" aria-selected="true">Full script<span class="dot"></span></button>
+      </div>
+
+      <div class="console" data-panel="setup"></div>
+      <div class="console" data-panel="enum"></div>
+      <div class="console" data-panel="probe"></div>
+      <div class="console" data-panel="ferox"></div>
+      <div class="console" data-panel="discover"></div>
+      <div class="console" data-panel="params"></div>
+      <div class="console on" data-panel="full"></div>
+
+      <div class="bar">
+        <button class="primary" id="copyMain" type="button">Copy full script</button>
+        <button class="ghost" id="dlMain" type="button">Download .sh</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const LS = "recon.console.cfg.v1";
+
+/* ---------- state ---------- */
+const state = {
+  profile:"balanced",
+  tools:{subfinder:true,assetfinder:true,amass:false,findomain:false,chaos:false,crtsh:false},
+  rx:{on:true,wild:true,dedupe:true,cname:false},
+  px:{sc:true,title:true,td:true,fr:true,ip:false,cdn:false,nuclei:false},
+  wl:"/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+  wlCustom:"",
+  ext:"php,html,txt,js,json,bak", extCustom:"",
+  fer:{threads:"40",rate:"100",depth:"2",codes:"404,403",k:true,norecur:false,redirects:false,rua:false},
+  params:{url:"",tools:{harvest:true,arjun:true,ffuf:false,ddpwn:true,kxss:false,nuclei:false},
+          wl:"/usr/share/seclists/Fuzzing/LFI/LFI-gracefulsecurity-linux.txt",wlCustom:"",
+          file:"/etc/passwd",match:"root:"},
+  disc:{tools:{waymore:true,waymoreResp:false,gau:false,wayback:true,paramspider:false,katana:true,xnlink:true,arjun:true,x8:false,gf:true},
+        depth:"3", cap:"25", wmlimit:"200",
+        gfpats:"lfi xss redirect ssrf sqli ssti rce idor",
+        interest:"login|search|api/|admin|upload|account|user|token|redirect|url=|file=|id="},
+  auth:{cookie:"", headers:"", burp:""},
+  armed:false,
+  autoinstall:false,
+  theme:"dark"
+};
+const PROFILES = {
+  stealth:{ px:"25", ferThreads:"10", ferRate:"20" },
+  balanced:{ px:"50", ferThreads:"40", ferRate:"100" },
+  aggressive:{ px:"150", ferThreads:"100", ferRate:"" }
+};
+
+/* ---------- target parsing ---------- */
+function parseTarget(raw){
+  let t = (raw||"").trim();
+  if(!t) return null;
+  t = t.replace(/^[a-z]+:\/\//i,"");        // scheme
+  t = t.replace(/^[^@]*@/,"");               // creds
+  t = t.split(/[\/?#]/)[0];                  // path/query
+  t = t.replace(/:\d+$/,"");                 // port
+  t = t.replace(/\.$/,"").toLowerCase();     // trailing dot
+  if(!t) return null;
+  const isIP = /^\d{1,3}(\.\d{1,3}){3}$/.test(t);
+  const wildcard = t.startsWith("*.");
+  const clean = wildcard ? t.slice(2) : t;
+  const hadWww = /^www\./.test(clean);
+  const host = clean.replace(/^www\./,"");
+  const labels = host.split(".");
+  const valid = isIP || (labels.length>=2 && labels.every(l=>/^[a-z0-9-]+$/.test(l) && !l.startsWith("-")));
+  // registrable domain: use 3 labels when the site sits under a known multi-label public suffix
+  const apex = isIP ? host : registrable(labels);
+  return {host,apex,isIP,wildcard,hadWww,valid,raw};
+}
+// common two-label public suffixes — extend as engagements need
+const MULTI_TLD = new Set([
+  "co.uk","org.uk","gov.uk","ac.uk","me.uk","ltd.uk","plc.uk","net.uk","sch.uk","nhs.uk","police.uk","mod.uk",
+  "com.au","net.au","org.au","edu.au","gov.au","asn.au","id.au",
+  "co.nz","net.nz","org.nz","govt.nz","ac.nz","geek.nz","school.nz",
+  "co.za","org.za","gov.za","ac.za","net.za","web.za",
+  "com.br","net.br","org.br","gov.br","edu.br",
+  "co.jp","or.jp","ne.jp","ac.jp","go.jp","co.kr","or.kr","go.kr",
+  "com.sg","edu.sg","gov.sg","com.my","edu.my","gov.my","org.my","net.my",
+  "com.cn","net.cn","org.cn","gov.cn","com.hk","org.hk","gov.hk",
+  "co.in","net.in","org.in","gov.in","com.mx","com.ar","com.tr","gov.tr",
+  "com.pl","gov.pl","co.il","org.il","gov.il","com.ua","co.id","or.id","go.id",
+  "com.ph","gov.ph","com.vn","gov.vn","com.sa","gov.sa","com.eg","gov.eg","com.ng","gov.ng","co.ke","or.ke"
+]);
+function registrable(labels){
+  if(labels.length<=2) return labels.join(".");
+  const last2 = labels.slice(-2).join(".");
+  return MULTI_TLD.has(last2) ? labels.slice(-3).join(".") : last2;
+}
+
+/* ---------- gather ---------- */
+const digits = (v,def)=>{ const n=String(v).replace(/[^0-9]/g,""); return n||def; };  // keep digits, fall back
+function sync(){
+  state.tools = {};
+  $$("#enumTools input").forEach(i=>state.tools[i.dataset.tool]=i.checked);
+  state.rx = {on:$("#rx_on").checked,wild:$("#rx_wild").checked,
+              dedupe:$("#rx_dedupe").checked,cname:$("#rx_cname").checked};
+  state.px = {sc:$("#px_sc").checked,title:$("#px_title").checked,td:$("#px_td").checked,
+              fr:$("#px_fr").checked,ip:$("#px_ip").checked,cdn:$("#px_cdn").checked,nuclei:$("#px_nuclei").checked};
+  const wlSel=$("#wl").value;
+  state.wl = wlSel==="__custom__" ? "__custom__" : wlSel;
+  state.wlCustom = $("#wlCustom").value.trim();
+  const exSel=$("#extPreset").value;
+  state.ext = exSel==="__custom__" ? "__custom__" : exSel;
+  state.extCustom = $("#extCustom").value.trim();
+  state.fer = {
+    threads:digits($("#ferThreads").value,"40"),
+    rate:$("#ferRate").value.trim().replace(/[^0-9]/g,""),   // may be empty (aggressive = no cap)
+    depth:digits($("#ferDepth").value,"2"),
+    codes:$("#ferFilterCodes").value.trim().replace(/[^0-9,]/g,""),   // digits + commas only
+    k:$("#fer_k").checked, norecur:$("#fer_norecur").checked,
+    redirects:$("#fer_redirects").checked, rua:$("#fer_rua").checked
+  };
+  const dt={}; $$("#discTools input").forEach(i=>dt[i.dataset.dtool]=i.checked);
+  state.disc = {
+    tools:dt,
+    depth:digits($("#dDepth").value,"3"),
+    cap:digits($("#dCap").value,"25"),
+    wmlimit:digits($("#dWmLimit").value,"200"),
+    gfpats:$("#dGfPats").value.trim()||"lfi xss redirect ssrf sqli",
+    interest:$("#dInterest").value.trim()||"login|search|api/|admin"
+  };
+  state.auth = {
+    cookie:$("#authCookie").value.trim(),
+    headers:$("#authHeaders").value,
+    burp:$("#authBurp").value.trim()
+  };
+  const pt={}; $$("#paramTools input").forEach(i=>pt[i.dataset.ptool]=i.checked);
+  const pwlSel=$("#pWl").value;
+  state.params = {
+    url:$("#pUrl").value.trim(), tools:pt,
+    wl: pwlSel==="__custom__" ? "__custom__" : pwlSel,
+    wlCustom:$("#pWlCustom").value.trim(),
+    file:$("#pFile").value.trim()||"/etc/passwd",
+    match:$("#pMatch").value.trim()||"root:"
+  };
+}
+function wordlist(){ return state.wl==="__custom__" ? (state.wlCustom||"<WORDLIST>") : state.wl; }
+function exts(){ return state.ext==="__custom__" ? state.extCustom : state.ext; }
+function pxThreads(){ return PROFILES[state.profile].px; }
+function pWordlist(){ return state.params.wl==="__custom__" ? (state.params.wlCustom||"<PAYLOADS>") : state.params.wl; }
+// single-quote a value for safe shell embedding (handles embedded quotes)
+function shq(s){ return "'"+String(s).replace(/'/g,"'\\''")+"'"; }
+/* ---------- auth orchestration: one source -> one preamble -> every authed tool ---------- */
+function authHeaderList(){ return (state.auth.headers||"").split(/\r?\n/).map(s=>s.trim()).filter(Boolean); }
+function authActive(){ return !!(state.auth.cookie || authHeaderList().length); }
+// preamble emitted once (full script) or at the top of a standalone fragment
+function authPreambleLines(){
+  if(!authActive()) return [];
+  const a=state.auth, hdrs=authHeaderList(), L=[];
+  L.push({c:"# ===== auth / session — edit once, reused by every authenticated tool =====", cls:"cm"});
+  if(a.cookie) L.push({c:`COOKIE=${shq(a.cookie)}`});
+  const arr=[];
+  if(a.cookie) arr.push(`-H "Cookie: $COOKIE"`);
+  hdrs.forEach(h=>arr.push(`-H ${shq(h)}`));
+  if(arr.length) L.push({c:`HDRS=(${arr.join(" ")})`});                 // repeated -H tools
+  if(hdrs.length) L.push({c:`HSTR=${shq(hdrs.join("; ")+";")}`});       // xnLinkFinder -H (one string)
+  const all=[]; if(a.cookie) all.push("Cookie: "+a.cookie); hdrs.forEach(h=>all.push(h));
+  if(all.length) L.push({c:`HALL=${shq(all.join("\n"))}`});            // arjun --headers (newline-separated)
+  L.push({c:""});
+  return L;
+}
+// prepend the preamble unless the caller (full script) already defined it
+function withAuth(L, opts){
+  if(authActive() && !(opts&&opts.authDefined)) L.unshift(...authPreambleLines());
+  return L;
+}
+function authSharedArgs(){ return authActive() ? ` "\${HDRS[@]}"` : ""; }      // httpx/katana/ffuf/nuclei/ferox/dalfox/x8
+function authArjunArgs(){ return authActive() ? ` --headers "$HALL"` : ""; }    // arjun
+function authXnlArgs(){ let s=""; if(authHeaderList().length) s+=` -H "$HSTR"`; if(state.auth.cookie) s+=` -c "$COOKIE"`; return s; }
+function authSqlmapArgs(){ let s=""; if(state.auth.cookie) s+=` --cookie "$COOKIE"`; if(authHeaderList().length) s+=` --headers="$HSTR"`; return s; }
+// literal -H flags (no $HDRS var) — for commands that run in a detached subshell (xargs/feroxbuster)
+function authLiteralArgs(){
+  if(!authActive()) return "";
+  const parts=[];
+  if(state.auth.cookie) parts.push(`-H ${shq("Cookie: "+state.auth.cookie)}`);
+  authHeaderList().forEach(h=>parts.push(`-H ${shq(h)}`));
+  return parts.length ? " "+parts.join(" ") : "";
+}
+
+/* ---------- command builders ---------- */
+// stop-if-empty guard. No '!' (breaks zsh history expansion on paste). fatal=true
+// (full runnable script) exits; fatal=false (a pasted fragment) just warns, so a
+// paste into an interactive shell can never close the terminal.
+function guard(file,msg,fatal){
+  return fatal
+    ? `[ -s ${file} ] || { echo "[x] ${msg}"; exit 0; }`
+    : `[ -s ${file} ] || echo "[x] ${msg}"`;
+}
+// bash apex() derives the registrable domain at runtime, so passing a different
+// domain as $1 stays correctly scoped (mirrors the JS MULTI_TLD list).
+function apexHelperLines(){
+  return [
+    {c:'MULTI_TLD=" co.uk org.uk gov.uk ac.uk me.uk net.uk sch.uk nhs.uk police.uk mod.uk com.au net.au org.au edu.au gov.au asn.au id.au co.nz net.nz org.nz govt.nz ac.nz co.za org.za gov.za ac.za net.za com.br net.br org.br gov.br edu.br co.jp or.jp ne.jp ac.jp go.jp co.kr or.kr com.sg edu.sg gov.sg com.my edu.my gov.my org.my com.cn net.cn org.cn com.hk org.hk co.in net.in org.in gov.in com.mx com.ar com.tr com.pl gov.pl co.il gov.il com.ua co.id com.ph com.vn com.sa com.eg com.ng co.ke "'},
+    {c:'apex(){ local h n l2 l3; h=$(printf "%s" "$1" | tr "A-Z" "a-z"); n=$(printf "%s" "$h" | awk -F. "{print NF}")'},
+    {c:'  [ "$n" -le 2 ] && { echo "$h"; return; }'},
+    {c:'  l2=$(cut -d. -f$((n-1))- <<<"$h"); l3=$(cut -d. -f$((n-2))- <<<"$h")'},
+    {c:'  case "$MULTI_TLD" in *" $l2 "*) echo "$l3";; *) echo "$l2";; esac; }'}
+  ];
+}
+function enumCmds(t, opts){
+  const withHeader = !opts || opts.header !== false;
+  const d = t? t.host : "<domain>";
+  const L=[];
+  if(withHeader){
+    L.push({c:"# workspace", cls:"cm"});
+    L.push({c:`DOMAIN="${d}"`});
+    apexHelperLines().forEach(x=>L.push(x));
+    L.push({c:`APEX="$(apex "$DOMAIN")"; APEXRE="\${APEX//./\\\\.}"`});
+    L.push({c:`OUT="$HOME/recon/$DOMAIN/$(date +%F)"; mkdir -p "$OUT"; cd "$OUT"`});
+    L.push({c:""});
+  }
+  if(t && t.isIP){
+    // an IP has no passive subdomain sources — seed it directly and skip enumeration
+    L.push({c:"# target is an IP — passive subdomain enumeration does not apply", cls:"cm"});
+    L.push({c:`echo "$DOMAIN" > subs.txt`});
+    L.push({c:`echo "[+] IP target seeded -> subs.txt"`});
+    return L;
+  }
+  L.push({c:"# passive subdomain enumeration (raw output isolated so re-runs don't self-ingest)", cls:"cm"});
+  L.push({c:`mkdir -p raw`});
+  if(state.tools.subfinder) L.push({c:`subfinder -d "$DOMAIN" -all -silent -o raw/subfinder.txt || true`});
+  if(state.tools.assetfinder) L.push({c:`assetfinder --subs-only "$DOMAIN" > raw/assetfinder.txt || true`});
+  if(state.tools.amass) L.push({c:`amass enum -passive -d "$DOMAIN" -o raw/amass.txt || true`});
+  if(state.tools.findomain) L.push({c:`findomain -t "$DOMAIN" -q > raw/findomain.txt || true`});
+  if(state.tools.chaos) L.push({c:`chaos -d "$DOMAIN" -silent > raw/chaos.txt || true   # needs CHAOS_KEY`});
+  if(state.tools.crtsh) L.push({c:`curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\\*\\.//g' > raw/crtsh.txt || true`});
+  L.push({c:""});
+  L.push({c:"# merge -> repair -> scope-guard -> dedupe (scope from $APEX at runtime)", cls:"cm"});
+  L.push({c:`find raw -type f -name '*.txt' 2>/dev/null -exec cat {} + \\`});   // glob-failure-proof (zsh nomatch safe)
+  L.push({c:`  | tr 'A-Z' 'a-z' | sed -E 's/\\.+/./g; s/^\\.//; s/\\.$//' \\`});   // lowercase, collapse '..', trim dots
+  L.push({c:'  | grep -iE "^([a-z0-9_-]+\\.)*${APEXRE}$" \\'});               // valid labels only, in-scope
+  L.push({c:`  | sort -u > subs.txt || true`});   // no matches under pipefail must not abort
+  L.push({c:guard("subs.txt","no in-scope names enumerated", !!(opts&&opts.fatal))});
+  if(state.rx.dedupe){
+    L.push({c:"# fold www. duplicates: drop www.X when X is also present", cls:"cm"});
+    L.push({c:`awk 'NR==FNR{a[$0];next}{h=$0;sub(/^www\\./,"",h); if($0~/^www\\./ && h in a) next; print}' subs.txt subs.txt > subs.dedup && mv subs.dedup subs.txt`});
+  }
+  L.push({c:`echo "[+] $(wc -l < subs.txt) unique in-scope name(s) -> subs.txt"`});
+  return L;
+}
+function probeCmds(t,opts){
+  const apex = t? t.apex : "$DOMAIN";
+  const apexRef = t? apex : "$DOMAIN";   // literal apex when known, else the shell var
+  const f=[];
+  if(state.px.sc) f.push("-sc");
+  if(state.px.title) f.push("-title");
+  if(state.px.td) f.push("-td");
+  if(state.px.fr) f.push("-fr");
+  if(state.px.ip) f.push("-ip");
+  if(state.px.cdn) f.push("-cdn");
+  const flags = f.join(" ");
+  const src = state.rx.on ? "resolved.txt" : "subs.txt";
+  const L=[];
+  if(state.rx.on){
+    L.push({c:"# resolve DNS first — keep only names that answer (who's actually up)", cls:"cm"});
+    const dnsxA=[`dnsx -l subs.txt -silent -a -aaaa -retry 2`];   // retry so slow resolvers aren't dropped
+    if(state.rx.cname) dnsxA.push("-cname -resp");
+    if(state.rx.wild) dnsxA.push(`-wd ${apexRef}`);   // discard wildcard-DNS answers
+    dnsxA.push("-o resolved.txt");
+    L.push({c:dnsxA.join(" ")});
+    L.push({c:`sort -u resolved.txt -o resolved.txt || true`});   // dedupe (A+AAAA / re-runs)
+    L.push({c:`echo "[+] $(wc -l < resolved.txt)/$(wc -l < subs.txt) name(s) resolve -> resolved.txt"`});
+    L.push({c:guard("resolved.txt","nothing resolved — check scope/DNS", !!(opts&&opts.fatal))});
+    L.push({c:""});
+  }
+  L.push({c:"# resolve the ProjectDiscovery httpx (python 'httpx' CLI shadows it and has no -l)", cls:"cm"});
+  L.push({c:`HTTPX="$HOME/go/bin/httpx"; [ -x "$HTTPX" ] || HTTPX="$(command -v httpx || echo httpx)"`});
+  L.push({c:"# probe for live hosts (-nc = no colour so status is parseable)", cls:"cm"});
+  L.push({c:(`"$HTTPX" -l ${src} ${flags} -nc -silent -threads ${pxThreads()}`.replace(/\s+/g," "))+authSharedArgs()+` -o live_detailed.txt`});
+  L.push({c:""});
+  L.push({c:"# status-code report, ordered by code (keeps title/tech)", cls:"cm"});
+  L.push({c:`awk '{ if(match($0,/\\[[0-9]{3}\\]/)) c=substr($0,RSTART+1,3); else c=0; print c" "$0 }' live_detailed.txt | sort -n | cut -d' ' -f2- > live_by_status.txt || true`});
+  L.push({c:`# tally per status code`, cls:"cm"});
+  L.push({c:`grep -oE '\\[[0-9]{3}\\]' live_detailed.txt | tr -d '[]' | sort | uniq -c | sort -rn > status_tally.txt || true`});
+  L.push({c:`echo "[+] status tally:"; cat status_tally.txt 2>/dev/null`});
+  L.push({c:""});
+  L.push({c:"# clean URL list for the next stages", cls:"cm"});
+  L.push({c:`cut -d' ' -f1 live_detailed.txt | sort -u > live.txt`});
+  L.push({c:`echo "[+] $(wc -l < live.txt) live host(s) -> live.txt  (ordered report -> live_by_status.txt)"`});
+  if(state.px.nuclei){
+    L.push({c:""});
+    if(state.armed){
+      L.push({c:"# auto-test every live host with nuclei (tech + known CVEs/misconfig)", cls:"cm"});
+      L.push({c:`nuclei -l live.txt -severity low,medium,high,critical${authSharedArgs()} -o live_nuclei.txt || true`});
+      L.push({c:`echo "[+] nuclei findings -> live_nuclei.txt"`});
+    }else{
+      L.push({c:'# nuclei-on-live [disarmed] — enable "Active: on" to test live hosts', cls:"cm"});
+    }
+  }
+  return withAuth(L,opts);
+}
+function feroxArgs(){
+  const a=[];
+  a.push(`-w "$WORDLIST"`);
+  const e=exts();
+  if(e) a.push(`-x ${e}`);
+  a.push(`-t ${state.fer.threads}`);
+  a.push(`-T 5 --time-limit 5m`);   // per-request timeout + hard cap so a host can't hang at 99%
+  if(state.fer.rate) a.push(`--rate-limit ${state.fer.rate}`);
+  if(state.fer.depth) a.push(`-d ${state.fer.depth}`);
+  if(state.fer.codes) a.push(`-C ${state.fer.codes}`);
+  if(state.fer.k) a.push(`-k`);
+  if(state.fer.norecur) a.push(`-n`);
+  if(state.fer.redirects) a.push(`-r`);
+  if(state.fer.rua) a.push(`-A`);
+  return a.join(" ");
+}
+function feroxCmds(opts){
+  if(!state.armed) return [{c:'# [disarmed] turn on "Active: on" (top-right) to generate the directory brute-force', cls:"cm"}];
+  const withHeader = !opts || opts.header !== false;
+  const par = {stealth:"1",balanced:"2",aggressive:"4"}[state.profile] || "2";
+  const L=[];
+  if(withHeader) L.push({c:`WORDLIST="${wordlist()}"`});
+  L.push({c:`mkdir -p ferox`});
+  L.push({c:guard("live.txt","no live hosts to brute", !!(opts&&opts.fatal))});
+  L.push({c:""});
+  L.push({c:`# one scan per live host, ${par} in parallel, port-safe per-target output`, cls:"cm"});
+  L.push({c:`scan(){ local url="$1" name`});
+  L.push({c:`  name=$(printf '%s' "$url" | sed -E 's~^https?://~~; s~[/:]+~_~g; s~_+$~~')`});   // keep port, filename-safe
+  L.push({c:`  echo "[*] $url"`});
+  L.push({c:`  feroxbuster -u "$url" ${feroxArgs()}${authLiteralArgs()} -o "ferox/\${name}.txt"`});
+  L.push({c:`}`});
+  L.push({c:`export -f scan; export WORDLIST`});
+  L.push({c:`xargs -P ${par} -I{} bash -c 'scan "$@"' _ {} < live.txt || true`});
+  return L;
+}
+/* ---------- parameter discovery (passive + crawl + JS, arjun gap-fill) ---------- */
+// methodology: passive (gau/waybackurls/paramspider) + crawl (katana -jc) first,
+// pull params from both, add JS-static params, then arjun ONLY on interesting endpoints.
+function discCmds(t, opts){
+  const fatal = !!(opts&&opts.fatal);
+  const D=state.disc, T=D.tools;
+  const thr = pxThreads();
+  const L=[];
+  L.push({c:`mkdir -p params`});
+  L.push({c:""});
+
+  // 1) passive
+  const passive = T.waymore||T.gau||T.wayback||T.paramspider;
+  if(passive){
+    L.push({c:"# 1) passive — real, already-used URLs from archives (zero traffic to target)", cls:"cm"});
+    L.push({c:`: > params/passive_urls.txt`});
+    if(T.waymore){
+      L.push({c:"# waymore: superset source (wayback+commoncrawl+otx+urlscan+vt+ghostarchive)", cls:"cm"});
+      L.push({c:`waymore -i "$DOMAIN" -mode U -f -xcc -oU params/waymore_urls.txt -ow 2>/dev/null || true`});
+      L.push({c:`grep -E '\\?' params/waymore_urls.txt 2>/dev/null >> params/passive_urls.txt || true`});
+      if(T.waymoreResp){
+        L.push({c:"# +responses: download archived responses, then mine them for more links/params", cls:"cm"});
+        L.push({c:`waymore -i "$DOMAIN" -mode R -xcc -l ${D.wmlimit} -ci d -oR params/waymore_resp 2>/dev/null || true`});
+        L.push({c:`xnLinkFinder -i params/waymore_resp -sf "$APEX" -op params/waymore_params.txt -o params/waymore_links.txt 2>/dev/null || true`});
+        L.push({c:`cat params/waymore_links.txt 2>/dev/null >> params/passive_urls.txt || true`});
+      }
+    }
+    if(T.gau)         L.push({c:`gau "$DOMAIN" --subs --threads ${thr} 2>/dev/null | grep -E '\\?' >> params/passive_urls.txt || true`});
+    if(T.wayback)     L.push({c:`echo "$DOMAIN" | waybackurls 2>/dev/null | grep -E '\\?' >> params/passive_urls.txt || true`});
+    if(T.paramspider) L.push({c:`paramspider -d "$DOMAIN" --level high -o params/paramspider.txt 2>/dev/null || true`});
+    L.push({c:`sort -u params/passive_urls.txt -o params/passive_urls.txt || true`});
+    L.push({c:""});
+  }
+
+  // 2) crawl (+JS) — authenticated when a session is set
+  if(T.katana){
+    L.push({c:"# 2) crawl live app incl. JavaScript (katana -jc) — finds params the archives missed", cls:"cm"});
+    L.push({c:`if [ -s live.txt ]; then`});
+    L.push({c:`  katana -list live.txt -jc -d ${D.depth} -kf all -silent${authSharedArgs()} -o params/crawled.txt || true`});
+    L.push({c:`else`});
+    L.push({c:`  katana -u "https://$DOMAIN" -jc -d ${D.depth} -kf all -silent${authSharedArgs()} -o params/crawled.txt || true`});
+    L.push({c:`fi`});
+    L.push({c:""});
+  }
+
+  // 3) extract param names from passive + crawl
+  L.push({c:"# 3) extract + dedupe parameter names (portable, no PCRE needed)", cls:"cm"});
+  L.push({c:`cat params/passive_urls.txt params/crawled.txt params/paramspider.txt 2>/dev/null \\`});
+  L.push({c:`  | grep -oE '[?&][a-zA-Z0-9_.-]+=' | tr -d '?&=' | sort -u > params/all_known_params.txt || true`});
+
+  // 4) JS static params
+  if(T.xnlink){
+    L.push({c:""});
+    L.push({c:"# 4) JS static analysis — param names hidden in JS bundles (often API-only)", cls:"cm"});
+    L.push({c:`grep -iE '\\.js(\\?|$)' params/crawled.txt 2>/dev/null | sort -u > params/js_urls.txt || true`});
+    L.push({c:`xnLinkFinder -i params/js_urls.txt -sf "$APEX"${authXnlArgs()} -op params/js_params.txt -o params/js_endpoints.txt 2>/dev/null || true`});
+    L.push({c:`# alt: cat params/js_urls.txt | while read -r j; do curl -s "$j" | jsluice urls; done`, cls:"cm"});
+    if(state.auth.burp){
+      L.push({c:"# parse intercepted authenticated traffic (Burp/ZAP/HAR) for endpoints + params", cls:"cm"});
+      L.push({c:`xnLinkFinder -i ${shq(state.auth.burp)} -sf "$APEX" -op params/burp_params.txt -o params/burp_links.txt 2>/dev/null || true`});
+      L.push({c:`cat params/burp_links.txt 2>/dev/null >> params/passive_urls.txt || true`});   // feed authed endpoints downstream
+    }
+    L.push({c:`cat params/all_known_params.txt params/js_params.txt params/burp_params.txt params/waymore_params.txt 2>/dev/null | sort -u > params/params_final.txt || true`});
+  } else {
+    L.push({c:`cat params/all_known_params.txt params/waymore_params.txt 2>/dev/null | sort -u > params/params_final.txt || true`});
+  }
+  L.push({c:`echo "[+] $(wc -l < params/params_final.txt 2>/dev/null) parameter name(s) discovered -> params/params_final.txt"`});
+
+  // 5) targeted arjun on interesting endpoints only
+  if(T.arjun){
+    L.push({c:""});
+    L.push({c:"# 5) arjun gap-fill — ONLY on interesting endpoints (targeted, not blind)", cls:"cm"});
+    L.push({c:`cat params/passive_urls.txt params/crawled.txt 2>/dev/null \\`});
+    L.push({c:`  | grep -iE ${shq(D.interest)} | sed -E 's/\\?.*//' | sort -u | head -n ${D.cap} > params/interesting.txt || true`});
+    L.push({c:guard("params/interesting.txt","no interesting endpoints matched — widen the filter",fatal)});
+    L.push({c:`while read -r ep; do`});
+    L.push({c:`  safe=$(printf '%s' "$ep" | sed -E 's~[^a-zA-Z0-9]~_~g')`});
+    L.push({c:`  echo "[*] arjun $ep"`});
+    L.push({c:`  arjun -u "$ep" -m GET,POST -t ${thr}${authArjunArgs()} -oT "params/arjun_\${safe}.txt" || true`});
+    L.push({c:`done < params/interesting.txt`});
+  }
+
+  // 6) x8 fast active brute using the discovered names as the wordlist
+  if(T.x8){
+    L.push({c:""});
+    if(state.armed){
+      L.push({c:"# 6) x8 — fast active parameter brute using discovered names as the wordlist", cls:"cm"});
+      L.push({c:`x8 -u "https://$DOMAIN/" -w params/params_final.txt${authSharedArgs()} -o params/x8.txt || true`});
+    }else{
+      L.push({c:'# 6) x8 [disarmed] — active brute; enable "Active: on" to generate', cls:"cm"});
+    }
+  }
+
+  // 7) gf classify -> hand each bucket to the right test
+  if(T.gf){
+    const pats = (D.gfpats||"").split(/\s+/).filter(p=>/^[a-z0-9_]+$/i.test(p));
+    if(pats.length){
+      L.push({c:""});
+      L.push({c:"# 7) classify URLs into bug-class candidates (gf), then hand each to the right test", cls:"cm"});
+      L.push({c:`cat params/passive_urls.txt params/crawled.txt 2>/dev/null | sort -u > params/all_urls.txt || true`});
+      L.push({c:`mkdir -p params/gf`});
+      L.push({c:`for pat in ${pats.join(" ")}; do`});
+      L.push({c:`  cat params/all_urls.txt | gf "$pat" 2>/dev/null | sort -u > "params/gf/$pat.txt" || true`});
+      L.push({c:`  n=$(wc -l < "params/gf/$pat.txt" 2>/dev/null); [ "\${n:-0}" -gt 0 ] && echo "[+] $pat: $n candidate URL(s)" || true`});
+      L.push({c:`done`});
+      L.push({c:""});
+      if(!state.armed){
+        L.push({c:'# handoff [disarmed] — buckets written above; enable "Active: on" to run dalfox/sqlmap/httpx probes', cls:"cm"});
+      } else {
+      L.push({c:"# targeted handoff — each line runs only when its bucket has hits", cls:"cm"});
+      L.push({c:`HTTPX="$HOME/go/bin/httpx"; [ -x "$HTTPX" ] || HTTPX="$(command -v httpx || echo httpx)"   # PD httpx`});
+      if(pats.includes("xss"))      L.push({c:`[ -s params/gf/xss.txt ] && dalfox file params/gf/xss.txt${authSharedArgs()} -o params/gf/xss_out.txt || true`});
+      if(pats.includes("redirect")) L.push({c:`[ -s params/gf/redirect.txt ] && cat params/gf/redirect.txt | qsreplace 'https://example.org/' | "$HTTPX" -silent -location${authSharedArgs()} 2>/dev/null | grep -i 'example.org' > params/gf/redirect_hits.txt || true`});
+      if(pats.includes("lfi"))      L.push({c:`[ -s params/gf/lfi.txt ] && cat params/gf/lfi.txt | qsreplace '/etc/passwd' | "$HTTPX" -silent -mr 'root:x'${authSharedArgs()} 2>/dev/null > params/gf/lfi_hits.txt || true`});
+      if(pats.includes("ssti"))     L.push({c:`[ -s params/gf/ssti.txt ] && cat params/gf/ssti.txt | qsreplace 'fpx{{7*7}}' | "$HTTPX" -silent -mr 'fpx49'${authSharedArgs()} 2>/dev/null > params/gf/ssti_hits.txt || true`});
+      if(pats.includes("sqli"))     L.push({c:`[ -s params/gf/sqli.txt ] && sqlmap -m params/gf/sqli.txt --batch --random-agent${authSqlmapArgs()} || true`});
+      if(pats.includes("ssrf"))     L.push({c:`[ -s params/gf/ssrf.txt ] && echo "[i] ssrf candidates -> params/gf/ssrf.txt (test with an OOB/interactsh payload)" || true`});
+      }
+    }
+  }
+
+  while(L.length && L[L.length-1].c==="") L.pop();
+  return withAuth(L,opts);
+}
+/* ---------- parameters & traversal (dotdotpwn, arjun, ffuf, gau, kxss, nuclei) ---------- */
+// one marker (FUZZ) in the URL is translated per-tool: ffuf keeps FUZZ, dotdotpwn uses TRAVERSAL.
+function paramsCmds(t, opts){
+  const fatal = !!(opts&&opts.fatal);
+  const P = state.params, T = P.tools;
+  const host = t? t.host : "<domain>";
+  const rawUrl = P.url;
+  let base = rawUrl;
+  if(base && !/FUZZ/.test(base)) base = base.replace(/=$/,"=FUZZ");   // "?s=" -> "?s=FUZZ"
+  const ffufUrl = base;                                   // ffuf injects at FUZZ
+  const ddUrl   = base ? base.replace(/FUZZ/g,"TRAVERSAL") : "";   // dotdotpwn keyword
+  const arjunUrl= base ? base.replace(/FUZZ/g,"1") : "";  // arjun wants a normal value
+  const thr = pxThreads();
+  const L=[];
+  if(!state.armed) return [{c:'# [disarmed] turn on "Active: on" (top-right) — these send payloads to the target', cls:"cm"}];
+  L.push({c:`mkdir -p params`});
+  if(rawUrl){ L.push({c:`PURL=${shq(base)}`}); }
+  L.push({c:""});
+
+  if(T.harvest){
+    L.push({c:"# harvest historical parameterised URLs from live hosts", cls:"cm"});
+    L.push({c:`cat live.txt 2>/dev/null | gau --threads ${thr} 2>/dev/null \\`});
+    L.push({c:`  | grep -E '[?&][^=]+=' | qsreplace -a 2>/dev/null | sort -u > params/urls.txt || true`});
+    L.push({c:guard("params/urls.txt","no parameterised URLs harvested (try waybackurls, or set a URL above)",fatal)});
+    L.push({c:""});
+  }
+  if(T.arjun){
+    L.push({c:"# discover hidden parameters (arjun)", cls:"cm"});
+    if(rawUrl) L.push({c:`arjun -u ${shq(arjunUrl)} -t ${thr}${authArjunArgs()} -oT params/arjun.txt || true`});
+    else       L.push({c:`arjun -i params/urls.txt -t ${thr}${authArjunArgs()} -oT params/arjun.txt || true`});
+    L.push({c:""});
+  }
+  if(T.ddpwn){
+    L.push({c:"# path-traversal fuzzing (dotdotpwn)", cls:"cm"});
+    if(rawUrl){
+      L.push({c:`# TRAVERSAL keyword marks the payload position in the URL`, cls:"cm"});
+      L.push({c:`dotdotpwn -m http-url -u ${shq(ddUrl)} -f ${shq(P.file)} -k ${shq(P.match)} -d 6 -b -q || true`});
+    }else{
+      L.push({c:`dotdotpwn -m http -h ${shq(host)} -f ${shq(P.file)} -k ${shq(P.match)} -d 6 -b -q || true`});
+    }
+    L.push({c:""});
+  }
+  if(T.ffuf){
+    L.push({c:"# fuzz the parameter value at FUZZ (payload list)", cls:"cm"});
+    if(rawUrl){
+      L.push({c:`ffuf -u "$PURL" -w ${shq(pWordlist())} -t ${thr} -mc all -fc 404 -ac${authSharedArgs()} \\`});
+      L.push({c:`  -o params/ffuf.json -of json || true`});
+    }else{
+      L.push({c:`# no URL set — fuzz each harvested URL that contains FUZZ`, cls:"cm"});
+      L.push({c:`while read -r u; do ffuf -u "$u" -w ${shq(pWordlist())} -t ${thr} -mc all -fc 404 -ac${authSharedArgs()} || true; done < params/urls.txt`});
+    }
+    L.push({c:""});
+  }
+  if(T.kxss){
+    L.push({c:"# reflected-parameter check — candidate XSS points (kxss)", cls:"cm"});
+    L.push({c:`cat params/urls.txt 2>/dev/null | kxss 2>/dev/null | tee params/reflected.txt || true`});
+    L.push({c:""});
+  }
+  if(T.nuclei){
+    L.push({c:"# nuclei fuzzing templates against parameterised URLs", cls:"cm"});
+    L.push({c:`nuclei -l params/urls.txt -t fuzzing/ -dast${authSharedArgs()} -o params/nuclei.txt || true`});
+    L.push({c:""});
+  }
+  // trim a trailing blank line
+  while(L.length && L[L.length-1].c==="") L.pop();
+  if(L.length<=2) L.push({c:"# enable a parameter test above to generate commands", cls:"cm"});
+  return withAuth(L,opts);
+}
+// collect the binaries the currently-enabled stages actually need
+function requiredBins(){
+  const b=new Set(); const T=state.tools, D=state.disc, DT=D.tools, P=state.params, PT=P.tools;
+  if(T.subfinder)b.add("subfinder"); if(T.assetfinder)b.add("assetfinder"); if(T.amass)b.add("amass");
+  if(T.findomain)b.add("findomain"); if(T.chaos)b.add("chaos");
+  if(T.crtsh){b.add("curl");b.add("jq");}
+  if(state.rx.on)b.add("dnsx");
+  b.add("httpx"); b.add("feroxbuster");
+  if(Object.values(DT).some(Boolean)){
+    if(DT.waymore){b.add("waymore"); if(DT.waymoreResp)b.add("xnLinkFinder");}
+    if(DT.gau)b.add("gau"); if(DT.wayback)b.add("waybackurls"); if(DT.paramspider)b.add("paramspider");
+    if(DT.katana)b.add("katana"); if(DT.xnlink)b.add("xnLinkFinder");
+    if(DT.arjun)b.add("arjun"); if(DT.x8)b.add("x8");
+    if(DT.gf){ b.add("gf"); b.add("qsreplace");
+      const pats=D.gfpats||""; if(/xss/.test(pats))b.add("dalfox"); if(/sqli/.test(pats))b.add("sqlmap"); }
+  }
+  if(Object.values(PT).some(Boolean)){
+    if(PT.harvest){b.add("gau");b.add("qsreplace");}
+    if(PT.arjun)b.add("arjun"); if(PT.ddpwn)b.add("dotdotpwn");
+    if(PT.ffuf)b.add("ffuf"); if(PT.kxss)b.add("kxss"); if(PT.nuclei)b.add("nuclei");
+  }
+  return Array.from(b);
+}
+// how to install each binary on Kali/WSL (go / pipx / cargo / apt / release binary)
+const INSTALL = {
+  subfinder:"go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+  httpx:"go install github.com/projectdiscovery/httpx/cmd/httpx@latest",
+  dnsx:"go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
+  nuclei:"go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+  katana:"go install github.com/projectdiscovery/katana/cmd/katana@latest",
+  chaos:"go install github.com/projectdiscovery/chaos-client/cmd/chaos@latest",
+  assetfinder:"go install github.com/tomnomnom/assetfinder@latest",
+  gau:"go install github.com/lc/gau/v2/cmd/gau@latest",
+  waybackurls:"go install github.com/tomnomnom/waybackurls@latest",
+  qsreplace:"go install github.com/tomnomnom/qsreplace@latest",
+  gf:"go install github.com/tomnomnom/gf@latest && { [ -d ~/.gf ] || git clone -q https://github.com/1ndianl33t/Gf-Patterns ~/.gf; }",
+  dalfox:"go install github.com/hahwul/dalfox/v2@latest",
+  ffuf:"go install github.com/ffuf/ffuf/v2@latest",
+  kxss:"go install github.com/Emoe/kxss@latest",
+  amass:"go install github.com/owasp-amass/amass/v4/...@master",
+  waymore:"pipx install waymore",
+  xnLinkFinder:"pipx install xnLinkFinder",
+  arjun:"pipx install arjun",
+  paramspider:"pipx install git+https://github.com/devanshbatham/paramspider",
+  x8:"cargo install x8",
+  feroxbuster:"sudo apt-get install -y feroxbuster",
+  sqlmap:"sudo apt-get install -y sqlmap",
+  dotdotpwn:"sudo apt-get install -y dotdotpwn",
+  curl:"sudo apt-get install -y curl",
+  jq:"sudo apt-get install -y jq",
+  findomain:"curl -sL https://github.com/findomain/findomain/releases/latest/download/findomain-linux -o /tmp/findomain && chmod +x /tmp/findomain && sudo mv /tmp/findomain /usr/local/bin/findomain"
+};
+function preflightLines(){
+  const bins=requiredBins();
+  const L=[];
+  L.push({c:`# ---- 0. preflight: ${state.autoinstall?"check + AUTO-INSTALL":"check"} required tooling ----`, cls:"cm"});
+  L.push({c:`export PATH="$PATH:$(go env GOPATH 2>/dev/null)/bin:$HOME/.local/bin:$HOME/.cargo/bin"`});   // go / pipx / cargo tool dirs
+  L.push({c:`AUTO=${state.autoinstall?1:0}`});
+  L.push({c:`ensure(){ if command -v "$1" >/dev/null 2>&1; then echo "[+] $1"; else echo "[x] $1 missing"; if [ "$AUTO" = 1 ]; then echo "    -> installing"; eval "$2" >/dev/null 2>&1 && echo "    -> ok" || echo "    -> FAILED (run manually): $2"; else echo "    -> $2"; fi; fi; }`});
+  // httpx is special: the python 'httpx' CLI shadows ProjectDiscovery httpx, so check the go binary by PATH
+  L.push({c:`ensurepd(){ if [ -x "$HOME/go/bin/$1" ]; then echo "[+] $1 (pd)"; else echo "[x] $1 (ProjectDiscovery) missing / shadowed by python httpx"; if [ "$AUTO" = 1 ]; then echo "    -> installing"; eval "$2" >/dev/null 2>&1 && echo "    -> ok" || echo "    -> FAILED: $2"; else echo "    -> $2"; fi; fi; }`});
+  bins.forEach(b=>{
+    const cmd=INSTALL[b] ? INSTALL[b].replace(/'/g,"'\\''") : `echo no-installer-for-${b}`;
+    L.push({c:`${b==="httpx"?"ensurepd":"ensure"} ${b} '${cmd}'`});
+  });
+  L.push({c:`hash -r 2>/dev/null || true   # refresh command lookup after installs`});
+  return L;
+}
+// standalone dependency check/install script for the Setup tab
+function setupCmds(){
+  const L=[];
+  L.push({c:"#!/usr/bin/env bash", cls:"cm"});
+  L.push({c:`# recon-console — dependency ${state.autoinstall?"INSTALL":"check"} for the enabled stages`, cls:"cm"});
+  L.push({c:`# toggle "Deps: check/install" in the header to switch modes`, cls:"cm"});
+  L.push({c:"set +e", cls:"kw"});
+  L.push({c:""});
+  preflightLines().forEach(x=>L.push(x));
+  L.push({c:""});
+  L.push({c:`echo "[+] setup complete — reopen a shell so PATH updates take effect"`});
+  return L;
+}
+function fullScript(t){
+  const d = t? t.host : "<domain>";
+  const L=[];
+  L.push({c:"#!/usr/bin/env bash", cls:"cm"});
+  L.push({c:"# recon-console — passive subs -> live probe -> dir brute", cls:"cm"});
+  L.push({c:"set -euo pipefail", cls:"kw"});
+  L.push({c:""});
+  L.push({c:`DOMAIN="\${1:-${d}}"`});
+  apexHelperLines().forEach(x=>L.push(x));
+  L.push({c:`APEX="$(apex "$DOMAIN")"; APEXRE="\${APEX//./\\\\.}"`});
+  L.push({c:`WORDLIST="${wordlist()}"`});
+  L.push({c:`OUT="$HOME/recon/$DOMAIN/$(date +%F)"; mkdir -p "$OUT"; cd "$OUT"`});
+  L.push({c:`echo "[*] target=$DOMAIN  apex=$APEX  out=$OUT"`});
+  L.push({c:""});
+  preflightLines().forEach(x=>L.push(x));       // stage 0: dependency check
+  L.push({c:""});
+  authPreambleLines().forEach(x=>L.push(x));   // define auth once; all stages below reuse it
+  L.push({c:"# ---- 1. enumerate ----", cls:"cm"});
+  enumCmds(t,{header:false,fatal:true}).forEach(x=>L.push(x));
+  L.push({c:""});
+  L.push({c:"# ---- 2. resolve + probe (who's up) ----", cls:"cm"});
+  probeCmds(t,{fatal:true,authDefined:true}).forEach(x=>L.push(x));
+  L.push({c:""});
+  L.push({c:"# ---- 3. diff vs previous run (daily-driver alerting) ----", cls:"cm"});
+  L.push({c:`PREV=$(ls -1dt "$HOME/recon/$DOMAIN"/*/ 2>/dev/null | sed -n 2p)`});
+  L.push({c:`if [ -n "\${PREV:-}" ] && [ -f "\${PREV}subs.txt" ]; then`});
+  L.push({c:`  comm -13 <(sort "\${PREV}subs.txt") <(sort subs.txt) > new.txt`});
+  L.push({c:`  echo "[+] $(wc -l < new.txt) new subdomain(s) since last run -> new.txt"`});
+  L.push({c:`fi`});
+  L.push({c:""});
+  L.push({c:"# ---- 4. directory brute ----", cls:"cm"});
+  feroxCmds({header:false,fatal:true}).forEach(x=>L.push(x));
+  const anyDisc = Object.values(state.disc.tools).some(Boolean);
+  if(anyDisc){
+    L.push({c:""});
+    L.push({c:"# ---- 5. parameter discovery ----", cls:"cm"});
+    discCmds(t,{fatal:false,authDefined:true}).forEach(x=>L.push(x));     // non-fatal
+  }
+  const anyParam = Object.values(state.params.tools).some(Boolean);
+  if(anyParam){
+    L.push({c:""});
+    L.push({c:"# ---- 6. parameters & traversal ----", cls:"cm"});
+    paramsCmds(t,{fatal:false,authDefined:true}).forEach(x=>L.push(x));   // non-fatal: don't abort the whole run
+  }
+  L.push({c:""});
+  L.push({c:`echo "[✓] done -> $OUT"`});
+  return L;
+}
+
+/* ---------- render ---------- */
+function highlight(line){
+  if(line.cls==="cm") return `<span class="cm">${esc(line.c)}</span>`;
+  if(line.cls==="kw") return `<span class="kw">${esc(line.c)}</span>`;
+  return esc(line.c);
+}
+function esc(s){return s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));}
+function plain(lines){return lines.map(l=>l.c).join("\n");}
+function box(title,note,lines){
+  const wrap=document.createElement("div"); wrap.className="stage";
+  const h=document.createElement("h3"); h.innerHTML=`${title} ${note?`<span class="n">${note}</span>`:""}`;
+  const cb=document.createElement("div"); cb.className="codebox";
+  const btn=document.createElement("button"); btn.className="copy"; btn.textContent="copy";
+  const txt=plain(lines);
+  btn.onclick=()=>copy(txt,btn);
+  const pre=document.createElement("pre"); pre.innerHTML=lines.map(highlight).join("\n");
+  cb.append(btn,pre); wrap.append(h,cb);
+  return {wrap,txt};
+}
+function render(){
+  sync();
+  const t=parseTarget($("#target").value);
+  updateReadout(t);
+  updateAlerts(t);
+
+  const setupP=$('.console[data-panel="setup"]');
+  const enumP=$('.console[data-panel="enum"]');
+  const probeP=$('.console[data-panel="probe"]');
+  const feroxP=$('.console[data-panel="ferox"]');
+  const discP=$('.console[data-panel="discover"]');
+  const paramsP=$('.console[data-panel="params"]');
+  const fullP=$('.console[data-panel="full"]');
+  [setupP,enumP,probeP,feroxP,discP,paramsP,fullP].forEach(p=>p.innerHTML="");
+
+  const setup=box("dependency setup", state.autoinstall?"install missing":"check only", setupCmds()); setupP.append(setup.wrap);
+
+  const enabledEnum = Object.values(state.tools).some(Boolean);
+  let enumTxt="";
+  if(!enabledEnum){
+    enumP.innerHTML='<div class="empty">Select at least one enumeration source.</div>';
+  }else{
+    const e=box("subdomain enumeration","",enumCmds(t)); enumP.append(e.wrap); enumTxt=e.txt;
+  }
+  const p=box("resolve + live host probe","dnsx → httpx",probeCmds(t)); probeP.append(p.wrap);
+  const f=box("directory brute-force","feroxbuster",feroxCmds()); feroxP.append(f.wrap);
+  const anyDisc = Object.values(state.disc.tools).some(Boolean);
+  let discTxt="";
+  if(!anyDisc){
+    discP.innerHTML='<div class="empty">Select at least one discovery source.</div>';
+  }else{
+    const dc=box("parameter discovery","passive → crawl → JS → arjun",discCmds(t)); discP.append(dc.wrap); discTxt=dc.txt;
+  }
+  const anyParam = Object.values(state.params.tools).some(Boolean);
+  let paramTxt="";
+  if(!anyParam){
+    paramsP.innerHTML='<div class="empty">Select at least one parameter test above.</div>';
+  }else{
+    const pr=box("parameters & traversal","arjun · ffuf · dotdotpwn",paramsCmds(t)); paramsP.append(pr.wrap); paramTxt=pr.txt;
+  }
+  const full=box("full pipeline","run: bash recon.sh [domain]",fullScript(t));
+  fullP.append(full.wrap);
+  window.__full = full.txt;
+  window.__panels = {setup:setup.txt, enum:enumTxt, probe:p.txt, ferox:f.txt, discover:discTxt, params:paramTxt, full:full.txt};
+  window.__domain = t ? t.host : "target";
+
+  // tab activity dots
+  $$('#tabs .tab').forEach(tab=>{
+    const has = tab.dataset.panel!=="enum" || enabledEnum;
+    tab.classList.toggle("has", !!(t&&t.valid&&has));
+  });
+  save();
+}
+function updateReadout(t){
+  const r=$("#readout");
+  if(!t){ r.className="readout"; r.innerHTML=""; return; }
+  r.className="readout on";
+  const parts=[];
+  parts.push(`<span>host <b>${esc(t.host)}</b></span>`);
+  parts.push(`<span>apex <b>${esc(t.apex)}</b></span>`);
+  parts.push(`<span>type <b>${t.isIP?"IPv4":"domain"}</b></span>`);
+  if(!t.valid) parts.push(`<span class="warn">format <b>check input</b></span>`);
+  r.innerHTML=parts.join("");
+}
+function updateAlerts(t){
+  const box=$("#alerts"); const A=[];
+  if(state.autoinstall) A.push(["w","!","Deps AUTO-INSTALL on — preflight will go install / pipx / cargo / apt any missing tool (apt steps need sudo). Turn off to only report."]);
+  if(state.armed) A.push(["w","!","ACTIVE TESTING ARMED — feroxbuster / ffuf / dotdotpwn / dalfox / sqlmap / x8 will send payloads. Confirm the target is in scope."]);
+  else A.push(["i","i","Active testing OFF — passive recon + discovery only. Brute/fuzz/exploit stages are suppressed until you click “Active: off” in the header."]);
+  if(t&&t.isIP) A.push(["i","i","Target is an IP. Passive subdomain sources won't apply. Run the probe + ferox stages directly against it."]);
+  if(t&&t.wildcard) A.push(["i","i","Wildcard stripped to the apex for enumeration."]);
+  if(t&&!t.valid&&!t.isIP) A.push(["w","!","Domain format looks off. Commands still generate but verify the host."]);
+  if(state.profile==="aggressive") A.push(["w","!","Aggressive profile: high thread count, no rate cap. Confirm the target is in scope and can take load."]);
+  if(state.tools.chaos) A.push(["i","i","chaos needs CHAOS_KEY exported in your env."]);
+  if(state.tools.crtsh) A.push(["i","i","crt.sh path requires curl + jq."]);
+  if(state.rx.on) A.push(["i","i","Resolve stage needs dnsx (ProjectDiscovery). Only names with a DNS record reach httpx."]);
+  if(state.rx.on && state.rx.wild) A.push(["i","i","Wildcard-DNS filtering on (-wd): apex catch-all records are discarded so you don't probe phantom hosts."]);
+  if(!state.rx.on) A.push(["w","!","Resolve disabled — httpx will be pointed at every enumerated name, including dead ones."]);
+  if(state.fer.norecur && state.fer.depth && state.fer.depth!=="1") A.push(["i","i","No-recursion is on, so depth is ignored by feroxbuster."]);
+  if(!exts() && state.ext!=="") A.push(["i","i","No extensions set. Directory-only brute."]);
+  if(state.wl==="__custom__" && !state.wlCustom) A.push(["w","!","Custom wordlist selected but no path entered."]);
+  // ---- parameter discovery module ----
+  const D=state.disc, anyDisc=Object.values(D.tools).some(Boolean);
+  if(anyDisc){
+    A.push(["i","i","Discovery order: passive (waymore/gau/waybackurls) + katana crawl first, then arjun only on interesting endpoints — real params first, active fuzzing last."]);
+    if(D.tools.waymore) A.push(["i","i","waymore is the superset passive source (wayback+CC+OTX+URLScan+VT+GhostArchive). Uses -xcc (CommonCrawl is often broken). Pass the domain only, never a subs file."]);
+    if(D.tools.waymoreResp) A.push(["w","!","waymore +responses downloads archived responses (-mode R) — thorough but slow; -l caps how many. Then xnLinkFinder mines them for links/params."]);
+    if(D.tools.waymore && (D.tools.gau||D.tools.wayback)) A.push(["i","i","waymore already covers gau + waybackurls sources — keeping them on is redundant (harmless, just slower)."]);
+    if(D.tools.xnlink) A.push(["i","i","JS param analysis uses xnLinkFinder (alt: jsluice). Highest-signal step for SPA / API-backed apps."]);
+    if(D.tools.x8) A.push(["w","!","x8 is active brute-force against the live target — confirm scope and rate tolerance."]);
+    if(D.tools.gf) A.push(["i","i","gf buckets discovered URLs by bug class, then hands each to its test (dalfox/httpx probes, and sqlmap for the sqli bucket). Needs: gf, qsreplace, dalfox, sqlmap, httpx."]);
+    if(D.tools.gf && /\bsqli\b/.test(D.gfpats||"")) A.push(["w","!","gf handoff runs sqlmap on the sqli bucket — that's active exploitation. Drop 'sqli' from the patterns to classify only."]);
+    if(!D.tools.gau && !D.tools.wayback && !D.tools.paramspider && !D.tools.katana) A.push(["w","!","No passive/crawl source enabled — arjun/x8 would run with no discovered URLs to work from."]);
+  }
+  // ---- auth / session ----
+  if(authActive()){
+    A.push(["i","i","Auth session flows to: httpx, katana, feroxbuster, ffuf, nuclei, dalfox, arjun, x8, xnLinkFinder, sqlmap."]);
+    A.push(["w","!","No auth on passive/traversal tools: waymore, gau, waybackurls, paramspider and dotdotpwn run unauthenticated (tool limitation)."]);
+    A.push(["i","i","Session tokens are NOT saved to localStorage — re-enter them per session (kept only in memory)."]);
+  }
+  if(state.auth.burp) A.push(["i","i","xnLinkFinder will parse "+esc(state.auth.burp)+" for authenticated endpoints + params and feed them downstream."]);
+  // ---- parameter / traversal module ----
+  const P=state.params, anyParam=Object.values(P.tools).some(Boolean);
+  if(anyParam){
+    if(!P.url && !P.tools.harvest) A.push(["w","!","Parameter tests enabled but no URL set and harvest is off — nothing to feed them. Add a URL or enable harvest."]);
+    if(P.tools.ddpwn) A.push(["i","i","dotdotpwn traversal: FUZZ in the URL is auto-swapped to the TRAVERSAL keyword; grabs "+esc(P.file)+" and matches \""+esc(P.match)+"\"."]);
+    if((P.tools.harvest||P.tools.kxss)) A.push(["i","i","Parameter tools required: gau, qsreplace, arjun, ffuf, kxss, dotdotpwn, nuclei (install what you enable)."]);
+    if(P.tools.ffuf && !P.url && !P.tools.harvest) A.push(["i","i","ffuf value-fuzz needs either a URL with FUZZ or harvested URLs."]);
+    if(P.wl==="__custom__" && !P.wlCustom) A.push(["w","!","Custom payload list selected but no path entered."]);
+    if(P.url && t && t.apex && !P.url.toLowerCase().includes(t.apex)) A.push(["w","!","Parameter URL host doesn't match the target apex ("+esc(t.apex)+"). Confirm it's in scope before fuzzing."]);
+  }
+  if(!t) A.push(["i","i","Enter a target to populate the commands."]);
+  box.innerHTML = A.map(([cls,ic,msg])=>`<div class="alert ${cls}"><span class="ic">${ic}</span><span>${esc(msg)}</span></div>`).join("");
+}
+
+/* ---------- copy / download ---------- */
+async function copy(text,btn){
+  try{ await navigator.clipboard.writeText(text); }
+  catch{ const ta=document.createElement("textarea"); ta.value=text; document.body.append(ta); ta.select();
+         try{document.execCommand("copy");}catch{} ta.remove(); }
+  const old=btn.textContent; btn.textContent="copied"; btn.classList.add("done");
+  setTimeout(()=>{btn.textContent=old; btn.classList.remove("done");},1200);
+}
+function activePanel(){ const t=$('.tab[aria-selected=true]'); return t?t.dataset.panel:"full"; }
+function activeText(){ const p=(window.__panels||{})[activePanel()]; return p!=null?p:(window.__full||""); }
+function dlName(){
+  const dom=(window.__domain||"target").replace(/[^a-z0-9.-]/gi,"_");
+  const date=new Date().toISOString().slice(0,10);
+  const pan=activePanel();
+  return pan==="full" ? `recon-${dom}-${date}.sh` : `recon-${pan}-${dom}-${date}.sh`;
+}
+$("#copyMain").onclick=()=>{
+  const b=$("#copyMain"); const old=b.textContent;
+  copy(activeText(),{textContent:"",classList:{add(){},remove(){}}});
+  b.textContent="Copied"; b.classList.add("done");
+  setTimeout(()=>{b.textContent=old; b.classList.remove("done");},1200);
+};
+$("#dlMain").onclick=()=>{
+  const txt=activeText();
+  try{
+    const blob=new Blob([txt],{type:"text/x-shellscript"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download=dlName(); document.body.append(a); a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},500);
+  }catch{ copy(txt,{textContent:"",classList:{add(){},remove(){}}}); alert("Download blocked here — copied to clipboard instead."); }
+};
+
+/* ---------- active-testing arm switch ---------- */
+function setArmed(on){
+  state.armed=!!on;
+  const b=$("#armBtn");
+  b.textContent = state.armed ? "Active: ON" : "Active: off";
+  b.classList.toggle("armed", state.armed);
+}
+$("#armBtn").onclick=()=>{ setArmed(!state.armed); render(); };
+function setAutoInstall(on){
+  state.autoinstall=!!on;
+  const b=$("#depsBtn");
+  b.textContent = state.autoinstall ? "Deps: install" : "Deps: check";
+  b.classList.toggle("armed", state.autoinstall);
+}
+$("#depsBtn").onclick=()=>{ setAutoInstall(!state.autoinstall); render(); };
+
+/* ---------- import auth from a pasted cURL / raw request ---------- */
+// Parses `curl ... -H '...' -b '...'`, DevTools "Copy as cURL", or a raw HTTP
+// header block, and returns {cookie, headers}. HttpOnly cookies are captured
+// because they travel in the request's own Cookie header.
+function parseAuthPaste(text){
+  text=(text||"").trim();
+  let cookie=""; const headers=[]; const SKIP=/^(host|content-length|connection|accept-encoding|:authority|:method|:path|:scheme|cache-control|pragma|sec-fetch-|sec-ch-|upgrade-insecure|te|priority)/i;
+  const add=(name,val)=>{ name=name.trim(); val=val.trim();
+    if(/^cookie$/i.test(name)){ cookie=val; return; }
+    if(!name||SKIP.test(name)) return;
+    headers.push(name+": "+val);
+  };
+  const looksCurl = /(^|\s)curl(\s|$)/i.test(text) || /\s-H\s|--header/.test(text);
+  if(looksCurl){
+    // unquoted -H/-b values (handles ' " and bare); line-continuations already fine
+    const reH=/(?:-H|--header)\s+(?:'([^']*)'|"([^"]*)"|(\S+))/g;
+    const reB=/(?:-b|--cookie)\s+(?:'([^']*)'|"([^"]*)"|(\S+))/g;
+    let m;
+    while((m=reH.exec(text))){ const h=m[1]??m[2]??m[3]??""; const i=h.indexOf(":"); if(i>0) add(h.slice(0,i),h.slice(i+1)); }
+    while((m=reB.exec(text))){ cookie=(m[1]??m[2]??m[3]??"").trim(); }
+  }else{
+    // raw request / header block
+    text.split(/\r?\n/).forEach(line=>{ const mm=line.match(/^\s*([A-Za-z0-9:_-]+):\s*(.*)$/); if(mm) add(mm[1],mm[2]); });
+  }
+  return {cookie, headers:headers.join("\n")};
+}
+$("#authImportBtn").onclick=()=>{
+  const parsed=parseAuthPaste($("#authImport").value);
+  const n=parsed.headers?parsed.headers.split("\n").filter(Boolean).length:0;
+  if(!parsed.cookie && !n){ $("#authImportMsg").textContent="Nothing recognised — paste a cURL command or a raw request with headers."; return; }
+  if(parsed.cookie) $("#authCookie").value=parsed.cookie;
+  if(parsed.headers) $("#authHeaders").value=parsed.headers;
+  $("#authImport").value="";
+  $("#authImportMsg").textContent=`Filled: ${parsed.cookie?"cookie + ":""}${n} header(s). Review below, then it flows to every authed tool.`;
+  render();
+};
+$("#authClearBtn").onclick=()=>{
+  $("#authCookie").value=""; $("#authHeaders").value=""; $("#authBurp").value=""; $("#authImport").value="";
+  $("#authImportMsg").textContent="Auth cleared.";
+  render();
+};
+
+/* ---------- config export / import (per-engagement, secrets excluded) ---------- */
+$("#exportBtn").onclick=()=>{
+  save();                                                 // writes current snapshot to localStorage
+  let snap; try{ snap=JSON.parse(localStorage.getItem(LS)||"{}"); }catch{ snap={}; }
+  // localStorage never holds auth, so the export is already secret-free
+  const dom=(window.__domain||"target").replace(/[^a-z0-9.-]/gi,"_");
+  const blob=new Blob([JSON.stringify(snap,null,2)],{type:"application/json"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+  a.download=`recon-config-${dom}.json`; document.body.append(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},500);
+};
+$("#importBtn").onclick=()=>$("#importFile").click();
+$("#importFile").onchange=e=>{
+  const f=e.target.files&&e.target.files[0]; if(!f) return;
+  const r=new FileReader();
+  r.onload=()=>{ try{
+      const cfg=JSON.parse(r.result);
+      if(!cfg||typeof cfg!=="object") throw 0;
+      localStorage.setItem(LS, JSON.stringify(cfg));      // load() applies it on reload
+      location.reload();
+    }catch{ alert("Not a valid Recon Console config file."); } };
+  r.readAsText(f);
+  e.target.value="";                                      // allow re-importing the same file
+};
+
+/* ---------- profile ---------- */
+function applyProfile(p){
+  state.profile=p;
+  $$("#profiles .pill").forEach(b=>b.setAttribute("aria-pressed", b.dataset.profile===p));
+  const cfg=PROFILES[p];
+  $("#ferThreads").value=cfg.ferThreads;
+  $("#ferRate").value=cfg.ferRate;
+  render();
+}
+
+/* ---------- persistence ---------- */
+function save(){
+  try{
+    const snap={
+      target:$("#target").value, profile:state.profile,
+      tools:state.tools, rx:state.rx, px:state.px,
+      wl:$("#wl").value, wlCustom:$("#wlCustom").value,
+      ext:$("#extPreset").value, extCustom:$("#extCustom").value,
+      fer:state.fer, disc:state.disc, params:state.params, armed:state.armed, autoinstall:state.autoinstall,
+      theme:document.documentElement.getAttribute("data-theme"),
+      panel:$('.tab[aria-selected=true]').dataset.panel
+    };
+    localStorage.setItem(LS, JSON.stringify(snap));
+  }catch{}
+}
+function load(){
+  let s; try{ s=JSON.parse(localStorage.getItem(LS)||"null"); }catch{ s=null; }
+  if(!s) return;
+  if(s.theme) setTheme(s.theme);
+  if(s.target) $("#target").value=s.target;
+  if(s.tools) $$("#enumTools input").forEach(i=>{ if(s.tools[i.dataset.tool]!==undefined) i.checked=s.tools[i.dataset.tool]; });
+  if(s.rx){ $("#rx_on").checked=!!s.rx.on; $("#rx_wild").checked=!!s.rx.wild;
+            $("#rx_dedupe").checked=!!s.rx.dedupe; $("#rx_cname").checked=!!s.rx.cname; }
+  if(s.px){ $("#px_sc").checked=!!s.px.sc; $("#px_title").checked=!!s.px.title; $("#px_td").checked=!!s.px.td;
+            $("#px_fr").checked=!!s.px.fr; $("#px_ip").checked=!!s.px.ip; $("#px_cdn").checked=!!s.px.cdn;
+            $("#px_nuclei").checked=!!s.px.nuclei; }
+  if(s.wl){ $("#wl").value=s.wl; if(s.wl==="__custom__") $("#wlCustomWrap").style.display=""; }
+  if(s.wlCustom) $("#wlCustom").value=s.wlCustom;
+  if(s.ext!==undefined){ $("#extPreset").value=s.ext; if(s.ext==="__custom__") $("#extCustomWrap").style.display=""; }
+  if(s.extCustom) $("#extCustom").value=s.extCustom;
+  if(s.fer){ $("#ferThreads").value=s.fer.threads; $("#ferRate").value=s.fer.rate; $("#ferDepth").value=s.fer.depth;
+             $("#ferFilterCodes").value=s.fer.codes; $("#fer_k").checked=!!s.fer.k; $("#fer_norecur").checked=!!s.fer.norecur;
+             $("#fer_redirects").checked=!!s.fer.redirects; $("#fer_rua").checked=!!s.fer.rua; }
+  if(s.disc){ const D=s.disc;
+    if(D.tools) $$("#discTools input").forEach(i=>{ if(D.tools[i.dataset.dtool]!==undefined) i.checked=D.tools[i.dataset.dtool]; });
+    if(D.depth) $("#dDepth").value=D.depth;
+    if(D.cap) $("#dCap").value=D.cap;
+    if(D.wmlimit) $("#dWmLimit").value=D.wmlimit;
+    if(D.gfpats) $("#dGfPats").value=D.gfpats;
+    if(D.interest) $("#dInterest").value=D.interest;
+  }
+  if(s.params){ const P=s.params;
+    if(P.url!==undefined) $("#pUrl").value=P.url;
+    if(P.tools) $$("#paramTools input").forEach(i=>{ if(P.tools[i.dataset.ptool]!==undefined) i.checked=P.tools[i.dataset.ptool]; });
+    if(P.wl){ $("#pWl").value=P.wl; if(P.wl==="__custom__") $("#pWlCustomWrap").style.display=""; }
+    if(P.wlCustom) $("#pWlCustom").value=P.wlCustom;
+    if(P.file) $("#pFile").value=P.file;
+    if(P.match) $("#pMatch").value=P.match;
+  }
+  if(s.profile){ state.profile=s.profile; $$("#profiles .pill").forEach(b=>b.setAttribute("aria-pressed", b.dataset.profile===s.profile)); }
+  setArmed(!!s.armed);
+  setAutoInstall(!!s.autoinstall);
+  if(s.panel) selectTab(s.panel);
+}
+
+/* ---------- theme ---------- */
+function setTheme(mode){
+  document.documentElement.setAttribute("data-theme",mode);
+  $("#themeBtn").textContent = mode==="dark" ? "Light" : "Dark";
+}
+$("#themeBtn").onclick=()=>{
+  const next = document.documentElement.getAttribute("data-theme")==="dark" ? "light":"dark";
+  setTheme(next); save();
+};
+
+/* ---------- tabs ---------- */
+function selectTab(name){
+  $$('#tabs .tab').forEach(t=>{ const on=t.dataset.panel===name;
+    t.setAttribute("aria-selected", on); t.tabIndex = on ? 0 : -1; });
+  $$('.console').forEach(c=>c.classList.toggle("on", c.dataset.panel===name));
+  const label = {setup:"Setup",enum:"Enum",probe:"Probe",ferox:"Ferox",discover:"Discover",params:"Params",full:"full script"}[name] || "full script";
+  $("#copyMain").textContent = name==="full" ? "Copy full script" : `Copy ${label}`;
+  $("#dlMain").textContent = name==="full" ? "Download .sh" : `Download ${label} .sh`;
+}
+$("#tabs").onclick=e=>{ const t=e.target.closest(".tab"); if(t){ selectTab(t.dataset.panel); save(); } };
+// arrow-key navigation across the tablist (WAI-ARIA pattern)
+$("#tabs").addEventListener("keydown",e=>{
+  const tabs=$$('#tabs .tab'); const i=tabs.findIndex(t=>t.getAttribute("aria-selected")==="true");
+  if(i<0) return; let j=-1;
+  if(e.key==="ArrowRight") j=(i+1)%tabs.length;
+  else if(e.key==="ArrowLeft") j=(i-1+tabs.length)%tabs.length;
+  else if(e.key==="Home") j=0;
+  else if(e.key==="End") j=tabs.length-1;
+  if(j>=0){ e.preventDefault(); selectTab(tabs[j].dataset.panel); tabs[j].focus(); save(); }
+});
+// link tabs<->panels for screen readers, once
+function initTabsA11y(){
+  $$('#tabs .tab').forEach(t=>{
+    const p=t.dataset.panel, panel=$(`.console[data-panel="${p}"]`);
+    t.id=t.id||`tab-${p}`;
+    if(panel){ panel.id=panel.id||`panel-${p}`; panel.setAttribute("role","tabpanel");
+      panel.setAttribute("aria-labelledby",t.id); panel.tabIndex=0; t.setAttribute("aria-controls",panel.id); }
+  });
+}
+
+/* ---------- collapsible control groups ---------- */
+$$('.controls .group > h2').forEach(h=>{
+  h.setAttribute("role","button"); h.tabIndex=0;
+  const toggle=()=>h.parentElement.classList.toggle("collapsed");
+  h.addEventListener("click",toggle);
+  h.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggle(); } });
+});
+
+/* ---------- reset ---------- */
+$("#resetBtn").onclick=()=>{
+  try{ localStorage.removeItem(LS); }catch{}
+  location.reload();
+};
+
+/* ---------- wire ---------- */
+$("#profiles").onclick=e=>{ const b=e.target.closest(".pill"); if(b) applyProfile(b.dataset.profile); };
+$("#wl").onchange=()=>{ $("#wlCustomWrap").style.display = $("#wl").value==="__custom__" ? "" : "none"; render(); };
+$("#extPreset").onchange=()=>{ $("#extCustomWrap").style.display = $("#extPreset").value==="__custom__" ? "" : "none"; render(); };
+$("#pWl").onchange=()=>{ $("#pWlCustomWrap").style.display = $("#pWl").value==="__custom__" ? "" : "none"; render(); };
+["input","change"].forEach(ev=>document.addEventListener(ev,e=>{
+  if(e.target.closest(".controls")) render();
+}));
+
+/* ---------- init ---------- */
+initTabsA11y();
+load();
+render();
+</script>
+</body>
+</html>

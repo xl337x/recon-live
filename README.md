@@ -1,0 +1,61 @@
+# recon-live
+
+A live recon and attack-surface mapping engine with an interactive browser dashboard, plus an offline command-script generator. Built for authorized penetration testing engagements.
+
+> WARNING: Authorized use only. Run this only against systems you own or have explicit written permission to test.
+
+## What's inside
+
+| File | What it is |
+|------|------------|
+| `recon-live.py` | Single-file (stdlib-only) engine that runs the recon pipeline and serves a real-time dashboard over SSE. Enter a scope in the page and watch every stage run. |
+| `Recon Console.html` | Offline, self-contained HTML that generates a portable bash recon and testing script. No server, works from `file://`. |
+
+## recon-live.py, the live dashboard
+
+Pipeline (each stage streamed live to the browser):
+
+```
+enum > resolve > probe > dirs > params > vulns > brain > intel
+```
+
+Features:
+
+* Full surface map. Every enumerated host is shown with a state badge: LIVE (HTTP up), DNS (resolves, no HTTP), or DEAD (enumerated, no DNS).
+* Discovery: subfinder and assetfinder, then dnsx, then ProjectDiscovery httpx (status, title, tech), then katana and gau for parameters, then feroxbuster for directories (bounded, quick wins first).
+* Vuln testing: confirmed-only LFI, SSTI, open-redirect and reflection checks, plus a signature-free differential probe that flags anomalous or injectable params by response diff.
+* Intel stage (smart, not hardcoded): nuclei `-as` (automatic template selection per detected tech) and nuclei `-dast` (fuzzing templates on discovered params). Detection logic lives in maintained YAML.
+* Brain: tech-aware routing. File-upload forms go to uploadpwn, login forms are flagged, tech CVEs run via nuclei tags.
+* Auth: `--cookie` and `--header` flow to every tool and request. Adaptive User-Agent rotation and WAF or rate-limit backoff.
+* Dashboard: colour-coded status table, tech badges, attack-surface score, per-host kill, rescan and nuclei actions, live filters (surface, status, text), radar pulse and row flash on discovery, and a Lists panel to dump all subs, live, params, full URLs and dirs (copy and download) at any time.
+
+### Run
+
+```bash
+python3 recon-live.py                 # opens a scope-entry screen in the page
+python3 recon-live.py example.com     # or start immediately
+# then open http://127.0.0.1:8899
+```
+
+Useful flags: `--port`, `--cookie`, `--header 'Authorization: Bearer ...'`, `--time-limit 3m`,
+`--ferox-parallel 3`, `--wordlist <path>`, `--uploadpwn "python3 /path/uploadpwn.py -u {url}"`, `--no-test` (discovery only).
+
+## Recon Console.html
+
+Open it in a browser (`file://` is fine). Enter a target, pick your options (speed profile, enum sources,
+resolve and probe, dir-brute, parameter discovery and testing, auth), toggle Active testing and Deps install,
+then Copy or Download the generated `.sh`. Runs the same pipeline offline as a script.
+
+## Requirements
+
+* Python 3.8 or newer.
+* Recon toolchain on PATH: `subfinder`, `assetfinder`, `dnsx`, `httpx` (ProjectDiscovery), `feroxbuster`,
+  `katana`, `gau`, `nuclei`. Optional: `uploadpwn`, `waybackurls`, `qsreplace`, `dalfox`, `sqlmap`, `x8`.
+
+Run `./setup.sh` on Kali or WSL to install the missing ones and fix PATH.
+
+> Note: ProjectDiscovery `httpx` must be resolvable (the Python `httpx` CLI shadows it). recon-live prefers `~/go/bin/httpx` automatically.
+
+## License
+
+For authorized security testing only. Use responsibly.

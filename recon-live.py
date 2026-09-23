@@ -1,0 +1,1190 @@
+#!/usr/bin/env python3
+"""
+recon-live — interactive live recon dashboard (single file, stdlib only).
+
+Usage:   python3 recon-live.py <domain> [--port 8899] [--wordlist PATH]
+Then open the URL it prints (http://127.0.0.1:8899).
+
+Pipeline: subfinder/assetfinder -> dnsx -> httpx(PD) -> feroxbuster (per host, watchdog)
+          -> katana/gau parameter discovery.  Live progress + actions in the browser.
+"""
+import sys, os, json, time, threading, subprocess, shutil, queue, argparse, html
+from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---------------- args ----------------
+ap = argparse.ArgumentParser()
+ap.add_argument("domain", nargs="?", default=None, help="scope (optional; if omitted, enter it in the page)")
+ap.add_argument("--port", type=int, default=8899)
+ap.add_argument("--wordlist", default="/usr/share/seclists/Discovery/Web-Content/common.txt")
+ap.add_argument("--ferox-parallel", type=int, default=3)
+ap.add_argument("--stall-secs", type=int, default=40, help="(legacy) unused; --time-limit bounds each host")
+ap.add_argument("--time-limit", default="3m", help="hard per-host ferox time cap (e.g. 90s, 3m)")
+ap.add_argument("--no-test", dest="test", action="store_false", help="discovery only; skip active LFI/SSTI/redirect/XSS testing")
+ap.add_argument("--cookie", default="", help="Cookie header value, flows to every authed tool + request")
+ap.add_argument("--header", action="append", default=[], help="extra header 'Name: value' (repeatable)")
+ap.add_argument("--uploadpwn", default="", help="path/command for uploadpwn; run on detected upload forms")
+ap.set_defaults(test=True)
+A = ap.parse_args()
+GOBIN = os.path.expanduser("~/go/bin")
+# make tools resolvable no matter which shell launched us (go / pipx / cargo bin dirs)
+for _d in (GOBIN, os.path.expanduser("~/.local/bin"), os.path.expanduser("~/.cargo/bin")):
+    if os.path.isdir(_d) and _d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+
+def tool(name, prefer_go=False):
+    """Resolve a binary, preferring ~/go/bin (fixes the python-httpx shadow)."""
+    g = os.path.join(GOBIN, name)
+    if prefer_go and os.path.exists(g):
+        return g
+    return shutil.which(name) or (g if os.path.exists(g) else None)
+
+HTTPX = tool("httpx", prefer_go=True)  # ProjectDiscovery httpx, not python httpx
+
+# ---------------- scope (set at launch OR from the page via POST /start) ----------------
+DOMAIN = ""
+OUT = ""
+AUTH_HEADERS = {}      # for urllib requests
+HDR_ARGS = []          # repeated -H args for httpx/katana/feroxbuster
+
+def set_scope(domain, cookie="", headers=None, uploadpwn=None, test=None):
+    global DOMAIN, OUT, AUTH_HEADERS, HDR_ARGS
+    DOMAIN = domain.strip().lower().lstrip("*.")
+    OUT = os.path.expanduser(f"~/recon/{DOMAIN}/{date.today()}")
+    os.makedirs(os.path.join(OUT, "ferox"), exist_ok=True)
+    os.makedirs(os.path.join(OUT, "params"), exist_ok=True)
+    AUTH_HEADERS = {}; HDR_ARGS = []
+    if cookie:
+        AUTH_HEADERS["Cookie"] = cookie; HDR_ARGS += ["-H", f"Cookie: {cookie}"]
+    for _h in (headers or []):
+        if ":" in _h:
+            k, v = _h.split(":", 1); AUTH_HEADERS[k.strip()] = v.strip(); HDR_ARGS += ["-H", _h]
+    if uploadpwn is not None: A.uploadpwn = uploadpwn
+    if test is not None: A.test = test
+
+def _secs(s):
+    s = str(s).strip().lower()
+    try:
+        if s.endswith("m"): return int(float(s[:-1]) * 60)
+        if s.endswith("h"): return int(float(s[:-1]) * 3600)
+        if s.endswith("s"): return int(float(s[:-1]))
+        return int(float(s))
+    except Exception:
+        return 180
+
+STAGE_NAMES = ["enum", "resolve", "probe", "dirs", "params", "vulns", "brain", "intel"]
+COUNT_KEYS = ["subs", "resolved", "live", "dirs", "params", "findings"]
+
+# ---------------- event bus ----------------
+subs_q = []            # SSE subscriber queues
+buslock = threading.Lock()
+STATE = {
+    "domain": "", "out": "", "started": time.time(), "phase": "idle",
+    "stages": {s: {"state": "pending", "pct": 0} for s in STAGE_NAMES},
+    "counts": {k: 0 for k in COUNT_KEYS},
+    "hosts": {},        # host -> {url,status,codes,title,tech,state,dirs,params,elapsed}
+    "feed": [],         # recent findings
+    "running": True,
+}
+
+def reset_state():
+    STATE["domain"] = DOMAIN; STATE["out"] = OUT; STATE["started"] = time.time(); STATE["phase"] = "running"
+    STATE["stages"] = {s: {"state": "pending", "pct": 0} for s in STAGE_NAMES}
+    STATE["counts"] = {k: 0 for k in COUNT_KEYS}
+    STATE["hosts"] = {}; STATE["feed"] = []; STATE["running"] = True
+
+def emit(ev):
+    ev.setdefault("ts", time.time())
+    with buslock:
+        _apply(ev)
+        dead = []
+        for q in subs_q:
+            try:
+                q.put_nowait(ev)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            subs_q.remove(q)
+
+def _apply(ev):
+    t = ev.get("type")
+    if t == "phase":
+        STATE["phase"] = ev["phase"]
+        if ev.get("domain"): STATE["domain"] = ev["domain"]
+    elif t == "stage":
+        STATE["stages"][ev["stage"]] = {"state": ev.get("state", "run"), "pct": ev.get("pct", STATE["stages"].get(ev["stage"], {}).get("pct", 0))}
+    elif t == "count":
+        STATE["counts"][ev["key"]] = ev["value"]
+    elif t == "host":
+        h = STATE["hosts"].setdefault(ev["host"], {"host": ev["host"], "dirs": [], "params": []})
+        for k in ("url", "status", "codes", "title", "tech", "map"):
+            if k in ev:
+                h[k] = ev[k]
+    elif t == "hoststate":
+        h = STATE["hosts"].setdefault(ev["host"], {"host": ev["host"], "dirs": [], "params": []})
+        h["state"] = ev["state"]
+        if "elapsed" in ev: h["elapsed"] = ev["elapsed"]
+        if "pct" in ev: h["pct"] = ev["pct"]
+    elif t == "hostscore":
+        h = STATE["hosts"].setdefault(ev["host"], {"host": ev["host"], "dirs": [], "params": []})
+        h["score"] = ev["score"]
+    elif t == "dir":
+        h = STATE["hosts"].setdefault(ev["host"], {"host": ev["host"], "dirs": [], "params": []})
+        h["dirs"].append({"path": ev["path"], "code": ev["code"], "size": ev.get("size")})
+    elif t == "param":
+        h = STATE["hosts"].setdefault(ev["host"], {"host": ev["host"], "dirs": [], "params": []})
+        if ev["name"] not in h["params"]:
+            h["params"].append(ev["name"])
+    elif t == "feed":
+        STATE["feed"].append(ev)
+        STATE["feed"] = STATE["feed"][-200:]
+
+def feed(msg, sev="info", host=None):
+    emit({"type": "feed", "msg": msg, "sev": sev, "host": host})
+
+def bump(key, n=1):
+    STATE["counts"][key] = STATE["counts"].get(key, 0) + n
+    emit({"type": "count", "key": key, "value": STATE["counts"][key]})
+
+# ---------------- subprocess helpers ----------------
+PROCS = {}   # host -> Popen (for kill/rescan)
+
+def stream(cmd, on_line, key=None):
+    try:
+        p = subprocess.Popen(cmd, cwd=OUT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    except FileNotFoundError:
+        feed(f"missing tool: {cmd[0]}", "high"); return None
+    if key:
+        PROCS[key] = p
+    for line in p.stdout:
+        on_line(line.rstrip("\n"))
+    p.wait()
+    return p
+
+# ---------------- pipeline stages ----------------
+def stage_enum():
+    emit({"type": "stage", "stage": "enum", "state": "run"})
+    feed("enumerating subdomains…")
+    found = set()
+    def add(l):
+        l = l.strip().lower().strip(".")
+        l = "".join(c for c in l if c.isprintable())
+        while ".." in l: l = l.replace("..", ".")
+        if l and (l == DOMAIN or l.endswith("." + DOMAIN)) and l not in found:
+            found.add(l); bump("subs")
+    if shutil.which("subfinder"): stream(["subfinder", "-d", DOMAIN, "-all", "-silent"], add)
+    if shutil.which("assetfinder"): stream(["assetfinder", "--subs-only", DOMAIN], add)
+    # fold www duplicates
+    clean = sorted(h for h in found if not (h.startswith("www.") and h[4:] in found))
+    open(os.path.join(OUT, "subs.txt"), "w").write("\n".join(clean) + "\n")
+    for h in clean:                                   # map EVERY name (offline until proven otherwise)
+        emit({"type": "host", "host": h, "map": "offline"})
+    emit({"type": "stage", "stage": "enum", "state": "done", "pct": 100})
+    feed(f"found {len(clean)} in-scope names (full surface map)", "good")
+    return clean
+
+def stage_resolve(subs):
+    emit({"type": "stage", "stage": "resolve", "state": "run"})
+    feed("resolving DNS (dnsx)…")
+    res = []
+    def _res(l):
+        h = l.strip()
+        if h:
+            res.append(h); bump("resolved")
+            emit({"type": "host", "host": h, "map": "resolved"})   # DNS ok (may still have no HTTP)
+    if shutil.which("dnsx"):
+        stream(["dnsx", "-l", os.path.join(OUT, "subs.txt"), "-silent", "-retry", "2"], _res)
+    else:
+        res = subs; feed("dnsx missing — skipping resolve", "med")
+    res = sorted(set(res))
+    open(os.path.join(OUT, "resolved.txt"), "w").write("\n".join(res) + "\n")
+    emit({"type": "stage", "stage": "resolve", "state": "done", "pct": 100})
+    feed(f"{len(res)} names resolve", "good")
+    return res
+
+def stage_probe(resolved):
+    emit({"type": "stage", "stage": "probe", "state": "run"})
+    feed("probing live hosts (httpx)…")
+    if not HTTPX:
+        feed("ProjectDiscovery httpx not found in ~/go/bin — install it", "high")
+        emit({"type": "stage", "stage": "probe", "state": "done"}); return []
+    live = []
+    def on(l):
+        try:
+            o = json.loads(l)
+        except Exception:
+            return
+        host = o.get("input") or o.get("host") or ""
+        url = o.get("url", "")
+        sc = o.get("status_code")
+        chain = o.get("chain_status_codes") or ([o.get("status_code")] if o.get("status_code") else [])
+        codes = ",".join(str(c) for c in chain) if chain else str(sc)
+        tech = o.get("tech") or o.get("technologies") or []
+        title = o.get("title", "") or ""
+        emit({"type": "host", "host": host, "url": url, "status": sc, "codes": codes, "title": title, "tech": tech, "map": "live"})
+        if url:
+            live.append(url); bump("live")
+    stream([HTTPX, "-l", os.path.join(OUT, "resolved.txt"), "-json", "-silent",
+            "-sc", "-title", "-td", "-fr", "-nc"] + HDR_ARGS, on)
+    open(os.path.join(OUT, "live.txt"), "w").write("\n".join(sorted(set(live))) + "\n")
+    emit({"type": "stage", "stage": "probe", "state": "done", "pct": 100})
+    feed(f"{len(live)} live hosts", "good")
+    return sorted(set(live))
+
+def _safe(url):
+    return "".join(c if c.isalnum() or c in ".-" else "_" for c in url.replace("https://", "").replace("http://", ""))
+
+def ferox_host(url, done_ref):
+    fero = shutil.which("feroxbuster")
+    if not fero:
+        feed("feroxbuster missing", "high"); return
+    host = url.replace("https://", "").replace("http://", "").split("/")[0]
+    name = _safe(url)
+    outp = os.path.join(OUT, "ferox", name + ".json")
+    cmd = [fero, "-u", url, "-w", A.wordlist, "-x", "php,html,txt", "-t", "40",
+           "-C", "404", "-k", "-n", "-T", "5", "--time-limit", A.time_limit, "--json", "--silent",
+           "--rate-limit", "150", "-o", outp] + HDR_ARGS
+    tl = _secs(A.time_limit)                      # hard per-host cap, in seconds
+    emit({"type": "hoststate", "host": host, "state": "scanning", "pct": 0})
+    feed(f"ferox → {host}", "info", host)
+    t0 = time.time(); last = [time.time()]; hits = [0]
+    try:
+        p = subprocess.Popen(cmd, cwd=OUT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    except Exception as e:
+        feed(f"ferox failed on {host}: {e}", "high"); return
+    PROCS[host] = p
+    def reader():
+        for line in p.stdout:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") == "response":
+                code = o.get("status"); path = o.get("url", "")
+                rel = path.split(host, 1)[-1] if host in path else path
+                emit({"type": "dir", "host": host, "path": rel, "code": code, "size": o.get("content_length")})
+                bump("dirs"); last[0] = time.time(); hits[0] += 1   # stream every hit immediately
+                if code in (200, 401, 403, 500):
+                    feed(f"{rel} [{code}] on {host}", "good" if code == 200 else "med", host)
+    rt = threading.Thread(target=reader, daemon=True); rt.start()
+    # time-based per-host progress bar (feroxbuster's --time-limit is the real bound; no dir-idle false kills)
+    while p.poll() is None:
+        time.sleep(2)
+        el = time.time() - t0
+        pct = min(99, int(el / tl * 100)) if tl else 0
+        emit({"type": "hoststate", "host": host, "state": "scanning", "elapsed": int(el), "pct": pct})
+        if el > tl + 45:                          # safety net if --time-limit is ignored
+            p.terminate()
+            try: p.wait(timeout=5)
+            except Exception: p.kill()
+            emit({"type": "hoststate", "host": host, "state": "stalled", "pct": 100})
+            feed(f"⚠ {host} hit time cap — moved on ({hits[0]} hits)", "med", host)
+            PROCS.pop(host, None); done_ref(); return
+    rt.join(timeout=3)
+    PROCS.pop(host, None)
+    st = STATE["hosts"].get(host, {}).get("state")
+    if st != "killed":
+        emit({"type": "hoststate", "host": host, "state": "done", "elapsed": int(time.time() - t0)})
+        feed(f"✓ {host} dir-brute done ({hits[0]} hits)", "good", host)
+    done_ref()
+
+def stage_dirs(live):
+    emit({"type": "stage", "stage": "dirs", "state": "run"})
+    feed(f"directory brute on {len(live)} hosts ({A.ferox_parallel} parallel)…")
+    total = max(1, len(live)); done = [0]
+    dlock = threading.Lock()
+    def done_ref():
+        with dlock:
+            done[0] += 1
+            emit({"type": "stage", "stage": "dirs", "state": "run", "pct": int(done[0] * 100 / total)})
+    # scan interesting hosts first (2xx/3xx before 4xx/5xx) so meaningful hits appear immediately
+    def _rank(u):
+        h = u.replace("https://", "").replace("http://", "").split("/")[0]
+        try: c = int(str(STATE["hosts"].get(h, {}).get("status") or 999).split(",")[-1])
+        except Exception: c = 999
+        return (0 if 200 <= c < 400 else 1, c)
+    live = sorted(live, key=_rank)
+    sem = threading.Semaphore(A.ferox_parallel)
+    threads = []
+    def worker(u):
+        with sem:
+            if not STATE["running"]: return
+            ferox_host(u, done_ref)
+    for u in live:
+        t = threading.Thread(target=worker, args=(u,), daemon=True); t.start(); threads.append(t)
+    for t in threads: t.join()
+    emit({"type": "stage", "stage": "dirs", "state": "done", "pct": 100})
+    feed("directory brute complete", "good")
+
+def stage_params(live):
+    emit({"type": "stage", "stage": "params", "state": "run"})
+    feed("discovering parameters (katana/gau)…")
+    urls = set(); params = set()
+    def add_url(l):
+        l = l.strip()
+        if "?" in l and "=" in l:
+            urls.add(l)
+            import re
+            for m in re.findall(r"[?&]([a-zA-Z0-9_.-]+)=", l):
+                if m not in params:
+                    params.add(m); bump("params")
+                    emit({"type": "param", "host": DOMAIN, "name": m})
+    if shutil.which("katana"):
+        stream(["katana", "-list", os.path.join(OUT, "live.txt"), "-jc", "-d", "2", "-silent"] + HDR_ARGS, add_url)
+    if shutil.which("gau"):
+        stream(["gau", DOMAIN, "--subs"], add_url)
+    open(os.path.join(OUT, "params", "urls.txt"), "w").write("\n".join(sorted(urls)) + "\n")
+    open(os.path.join(OUT, "params", "params.txt"), "w").write("\n".join(sorted(params)) + "\n")
+    emit({"type": "stage", "stage": "params", "state": "done", "pct": 100})
+    feed(f"{len(params)} unique parameters discovered", "good")
+
+# ---------------- active vulnerability testing (urllib, no external deps) ----------------
+import urllib.request, urllib.parse, urllib.error, ssl, re as _re, random
+_CTX = ssl.create_default_context(); _CTX.check_hostname = False; _CTX.verify_mode = ssl.CERT_NONE
+class _NR(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+_NOREDIR = urllib.request.build_opener(_NR(), urllib.request.HTTPSHandler(context=_CTX))
+
+# adaptive brain: rotate UAs, detect WAF/rate-limit, back off automatically
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+]
+WAF = {"tripped": False, "hits": 0, "delay": 0.0}
+def _waf_check(code, hdrs):
+    fp = (str(hdrs.get("Server", "")) + str(hdrs.get("X-Powered-By", "")) + str(hdrs.get("cf-ray", ""))).lower()
+    waffy = any(w in fp for w in ("cloudflare", "akamai", "sucuri", "incapsula", "imperva", "f5", "awselb", "mod_security"))
+    if code in (403, 429, 503) or (code == 406):
+        WAF["hits"] += 1
+        if code in (429, 503) or WAF["hits"] >= 8:
+            WAF["delay"] = min(WAF["delay"] + 0.5, 2.5)
+            if not WAF["tripped"]:
+                WAF["tripped"] = True
+                feed(f"⚠ WAF/rate-limit signals ({code}{', ' + fp if waffy else ''}) — throttling + rotating UA", "med")
+
+LFI_PAYLOADS = [
+    "../../../../../../../../etc/passwd",
+    "..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+    "....//....//....//....//....//....//etc/passwd",
+    "..%252f..%252f..%252f..%252fetc%252fpasswd",
+    "/etc/passwd",
+    "../../../../../../proc/self/environ",
+    "php://filter/convert.base64-encode/resource=index.php",
+]
+LFI_MARKERS = [b"root:x:0:0", b"daemon:x:", b"/bin/bash", b"DOCUMENT_ROOT=", b"HTTP_USER_AGENT=", b"PD9waHA"]
+LFI_RE = _re.compile(rb"root:[^:\n]*:0:0:")
+SSTI_TOKEN = "recon7x7"; SSTI_PAYLOAD = "recon{{7*7}}"; SSTI_HIT = b"recon49"
+XSS_PAYLOAD = "recon<b7>x"; XSS_HIT = b"recon<b7>x"
+
+def _get(url, opener=None, timeout=8):
+    if WAF["delay"]:
+        time.sleep(WAF["delay"] + random.uniform(0, 0.3))   # backoff + jitter when throttled
+    hdrs = {"User-Agent": random.choice(UA_POOL)}; hdrs.update(AUTH_HEADERS)
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        r = opener.open(req, timeout=timeout) if opener else urllib.request.urlopen(req, timeout=timeout, context=_CTX)
+        with r:
+            return getattr(r, "status", None), dict(r.headers), r.read(300000)
+    except urllib.error.HTTPError as e:
+        hd = dict(e.headers or {}); _waf_check(e.code, hd)
+        try: body = e.read(300000)
+        except Exception: body = b""
+        return e.code, hd, body
+    except Exception:
+        return None, {}, b""
+
+def _inject(url, param, value):
+    u = urllib.parse.urlsplit(url); parts = []
+    for kv in u.query.split("&"):
+        if not kv: continue
+        k = kv.split("=", 1)[0]
+        parts.append(f"{k}={value}" if k == param else kv)
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, "&".join(parts), ""))
+
+ERR_SIGS = [b"sql syntax", b"mysql_", b"ora-0", b"odbc", b"sqlite", b"psql", b"syntax error",
+            b"unterminated", b"unexpected token", b"stack trace", b"traceback (most recent",
+            b"exception in thread", b"java.lang.", b"system.web", b"fatal error", b"warning: "]
+def anomaly_probe(url, param, host):
+    """Signature-free differential: mutate the param and infer 'injectable/anomalous' from
+    how the response CHANGES vs a benign baseline — not a fixed payload-per-bug."""
+    b_sc, _, base = _get(_inject(url, param, "reconBASELINE1"))
+    if base is None: return
+    base_l = len(base); base_has_err = any(e in base.lower() for e in ERR_SIGS)
+    for probe, label in (("'\"`\\", "quote/backslash"), ("{{7*7}}", "template"), ("<x>", "markup"), ("`;id;`", "cmd/os")):
+        sc, _, body = _get(_inject(url, param, urllib.parse.quote(probe)))
+        if body is None: continue
+        bl = body.lower()
+        # newly-appearing error/stack signature = strong injectable signal
+        if not base_has_err and any(e in bl for e in ERR_SIGS):
+            emit({"type": "finding", "sev": "med", "host": host}); bump("findings")
+            feed(f"⚑ anomalous error surfaced — {param} via {label} (possible injection) — {url[:70]}", "med", host)
+            return
+        # large response-size swing on a mutated value = worth manual review
+        if base_l and abs(len(body) - base_l) > max(400, base_l * 0.5) and sc == b_sc:
+            emit({"type": "finding", "sev": "low", "host": host}); bump("findings")
+            feed(f"⚑ response diverges on {param} via {label} (Δ{len(body)-base_l}b) — review — {url[:60]}", "low", host)
+            return
+
+def _redirects_to(loc, host):
+    """True only if a Location header's TARGET host is exactly `host` (not a query echo)."""
+    if not loc: return False
+    l = loc.strip().lower()
+    for pre in ("https://", "http://", "//"):
+        if l.startswith(pre):
+            rest = l[len(pre):]
+            return rest == host or rest[:len(host) + 1] in (host + "/", host + ":", host + "?", host + "#")
+    return False
+
+def stage_vulns():
+    emit({"type": "stage", "stage": "vulns", "state": "run"})
+    feed("active testing discovered params (LFI/SSTI/redirect/reflection)…")
+    try:
+        urls = [l.strip() for l in open(os.path.join(OUT, "params", "urls.txt")) if "?" in l and "=" in l]
+    except Exception:
+        urls = []
+    seen = set(); tasks = []
+    for url in urls:
+        u = urllib.parse.urlsplit(url)
+        for kv in u.query.split("&"):
+            if "=" not in kv: continue
+            k = kv.split("=", 1)[0]
+            key = (u.scheme, u.netloc, u.path, k)
+            if key in seen: continue
+            seen.add(key); tasks.append((url, k))
+    tasks = tasks[:250]  # bound the request volume
+    feed(f"testing {len(tasks)} unique endpoint/param combos…")
+    sem = threading.Semaphore(8)
+    def test(url, param):
+        with sem:
+            if not STATE["running"]: return
+            host = urllib.parse.urlsplit(url).netloc
+            # 1) LFI / path traversal
+            for pl in LFI_PAYLOADS:
+                t = _inject(url, param, pl)
+                sc, hd, body = _get(t)
+                if body and (any(m in body for m in LFI_MARKERS) or LFI_RE.search(body)):
+                    emit({"type": "finding", "sev": "crit", "host": host})
+                    feed(f"‼ LFI/traversal — {param} → {t}", "crit", host); bump("findings"); break
+            # 2) SSTI
+            t = _inject(url, param, urllib.parse.quote(SSTI_PAYLOAD))
+            sc, hd, body = _get(t)
+            if SSTI_HIT in (body or b""):
+                emit({"type": "finding", "sev": "crit", "host": host})
+                feed(f"‼ SSTI (7*7=49) — {param} → {t}", "crit", host); bump("findings")
+            # 3) reflected value (XSS candidate)
+            t = _inject(url, param, urllib.parse.quote(XSS_PAYLOAD))
+            sc, hd, body = _get(t)
+            if XSS_HIT in (body or b""):
+                emit({"type": "finding", "sev": "high", "host": host})
+                feed(f"★ reflected unescaped — {param} (XSS candidate) → {t}", "high", host); bump("findings")
+            # 4) open redirect — CONFIRMED only: real 3xx whose Location TARGET is our host
+            #    (not a substring match — that flags http->https canonical redirects that
+            #     merely echo the query string, i.e. false positives)
+            t = _inject(url, param, "https://recon.example/")
+            sc, hd, body = _get(t, opener=_NOREDIR)
+            loc = (hd.get("Location") or hd.get("location") or "").strip()
+            if sc in (301, 302, 303, 307, 308) and _redirects_to(loc, "recon.example"):
+                emit({"type": "finding", "sev": "high", "host": host})
+                feed(f"↪ open redirect CONFIRMED — {param} -> {loc[:80]}", "high", host); bump("findings")
+            # 5) behavioral / differential — signature-free anomaly (no fixed payload per bug)
+            anomaly_probe(url, param, host)
+    th = []
+    for (url, param) in tasks:
+        x = threading.Thread(target=test, args=(url, param), daemon=True); x.start(); th.append(x)
+    for x in th: x.join()
+    emit({"type": "stage", "stage": "vulns", "state": "done", "pct": 100})
+    n = STATE["counts"].get("findings", 0)
+    feed(f"active testing complete — {n} finding(s)", "good" if n == 0 else "crit")
+
+# ---------------- the "brain": signal -> test routing ----------------
+UPLOAD_RE = _re.compile(rb'type=["\']?\s*file|enctype=["\']?\s*multipart/form-data', _re.I)
+LOGIN_RE = _re.compile(rb'type=["\']?\s*password', _re.I)
+
+def _uploadpwn_path():
+    if A.uploadpwn:
+        return A.uploadpwn
+    p = os.path.expanduser("~/tools/uploadpwn/uploadpwn.py")
+    return p if os.path.exists(p) else ""
+
+def run_uploadpwn(url, host, timeout=240):
+    import shlex
+    up = _uploadpwn_path()
+    if not up:
+        feed(f"⇪ upload point — install uploadpwn or pass --uploadpwn: {url}", "med", host); return
+    report = os.path.join(OUT, "params", f"uploadpwn_{_safe(url)}.json")
+    if "{url}" in up:
+        cmd = shlex.split(up.replace("{url}", url))
+    else:
+        cmd = ["python3", up, "-t", url, "--discover", "--all", "--i-am-authorized",
+               "--crawl-depth", "1", "-o", report]
+        if A.cookie: cmd += ["--header", f"Cookie: {A.cookie}"]
+        for h in A.header: cmd += ["--header", h]
+    feed(f"uploadpwn → {host} (all bypass modules)", "info", host)
+    def on(l):
+        l = l.strip()
+        if l and any(k in l.lower() for k in ("bypass", "success", "rce", "uploaded", "shell obtained", "vulnerable", "confirmed", "[+]")):
+            feed(f"uploadpwn[{host}]: {l[:160]}", "crit", host); bump("findings")
+    try:
+        p = subprocess.Popen(cmd, cwd=OUT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except Exception as e:
+        feed(f"uploadpwn failed on {host}: {e}", "med", host); return
+    PROCS["upload:" + host] = p
+    timer = threading.Timer(timeout, lambda: p.poll() is None and p.terminate())
+    timer.start()
+    for line in p.stdout:
+        on(line)
+    p.wait(); timer.cancel(); PROCS.pop("upload:" + host, None)
+    # summarize JSON report if present
+    try:
+        rep = json.load(open(report))
+        vulns = rep.get("vulnerabilities") or rep.get("findings") or rep.get("successes") or []
+        if vulns:
+            feed(f"‼ uploadpwn: {len(vulns)} upload bypass(es) on {host} → {os.path.basename(report)}", "crit", host)
+    except Exception:
+        pass
+
+def run_nuclei_tags(url, host, tags):
+    nuc = shutil.which("nuclei")
+    if not nuc:
+        feed(f"tech={tags} on {host} — install nuclei to auto-test", "med", host); return
+    feed(f"nuclei ({tags}) → {host}", "info", host)
+    def on(l):
+        l = l.strip()
+        if l:
+            sev = "crit" if "critical" in l.lower() else "high" if "high" in l.lower() else "med"
+            feed(f"nuclei: {l}", sev, host); bump("findings")
+    stream([nuc, "-u", url, "-tags", tags, "-severity", "low,medium,high,critical", "-silent", "-nc"] + HDR_ARGS, on, key="nuclei:" + host)
+
+INTERESTING_PATH = _re.compile(r"(admin|login|api|upload|dashboard|manage|config|backup|dev|staging|internal|graphql|swagger|actuator)", _re.I)
+def score_host(host, upload=False, login=False, api=False, tech=""):
+    """Attack-surface score → the brain focuses effort on the juiciest hosts."""
+    h = STATE["hosts"].get(host, {})
+    s = 0
+    s += len(h.get("params", [])) * 2
+    s += len(h.get("dirs", [])) * 1
+    if upload: s += 12
+    if login: s += 4
+    if api: s += 5
+    for d in h.get("dirs", []):
+        if INTERESTING_PATH.search(d.get("path", "")): s += 3
+    if any(t in tech for t in ("wordpress", "joomla", "drupal", "jenkins", "tomcat", "gitlab", "jira", "confluence")): s += 4
+    try:
+        code = int(str(h.get("status") or "0").split(",")[-1])
+        if code in (401, 403): s += 2          # protected = interesting
+    except Exception: pass
+    emit({"type": "hostscore", "host": host, "score": s})
+
+def cors_host_checks(url, host):
+    """No-dep coverage: reflected-origin CORS + Host-header injection."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": random.choice(UA_POOL), "Origin": "https://recon.evil", **AUTH_HEADERS})
+        with urllib.request.urlopen(req, timeout=8, context=_CTX) as r:
+            acao = r.headers.get("Access-Control-Allow-Origin", "").strip(); acac = r.headers.get("Access-Control-Allow-Credentials", "").strip()
+            # real finding: ACAO exactly reflects our injected Origin, OR wildcard + credentials
+            if acao.lower() == "https://recon.evil" or (acao == "*" and acac.lower() == "true"):
+                emit({"type": "finding", "sev": "high", "host": host}); bump("findings")
+                feed(f"↔ CORS misconfig on {host} (ACAO={acao}{' + creds' if acac.lower()=='true' else ''})", "high", host)
+    except Exception: pass
+    try:
+        # real finding: our injected Host actually controls an absolute redirect target
+        req = urllib.request.Request(url, headers={"User-Agent": random.choice(UA_POOL), "Host": "recon.evil", **AUTH_HEADERS})
+        r = _NOREDIR.open(req, timeout=8)
+        loc = r.headers.get("Location", "").strip()
+        if _redirects_to(loc, "recon.evil"):
+            emit({"type": "finding", "sev": "med", "host": host}); bump("findings")
+            feed(f"🧭 Host-header controls redirect on {host} -> {loc[:80]}", "med", host)
+    except Exception: pass
+
+def check_session(live):
+    """Auth scenario: if creds were supplied, verify the session is actually valid."""
+    if not AUTH_HEADERS or not live: return
+    sc, hd, body = _get(live[0], timeout=10)
+    if body and LOGIN_RE.search(body):
+        feed("⚠ session check: a login form still appears with your creds set — cookie may be expired/invalid", "med")
+    elif sc in (401, 403):
+        feed(f"⚠ session check: {live[0]} returns {sc} with your creds — auth may not be applying", "med")
+    else:
+        feed("✓ session looks valid (authenticated requests accepted)", "good")
+
+# ---------- smart detection: nuclei (auto templates + DAST) — logic lives in maintained YAML ----------
+def _host_of(s):
+    try: return urllib.parse.urlsplit(s if "://" in s else "https://" + s).netloc or DOMAIN
+    except Exception: return DOMAIN
+
+def _nuclei_stream(cmd, tag):
+    def on(line):
+        try: o = json.loads(line)
+        except Exception: return
+        info = o.get("info", {}) or {}
+        sev = (info.get("severity") or "info").lower()
+        name = info.get("name") or o.get("template-id", "")
+        at = o.get("matched-at") or o.get("matched") or o.get("host", "")
+        m = {"critical": "crit", "high": "high", "medium": "med"}.get(sev, "info")
+        if sev in ("critical", "high", "medium", "low"):
+            emit({"type": "finding", "sev": m, "host": _host_of(at)}); bump("findings")
+            feed(f"nuclei[{sev}] {name} — {at}"[:150], m, _host_of(at))
+    stream(cmd, on, key=tag)
+
+def stage_intel():
+    emit({"type": "stage", "stage": "intel", "state": "run"})
+    nuc = shutil.which("nuclei")
+    if not nuc:
+        feed("nuclei missing — smart detection unavailable; install it", "med")
+        emit({"type": "stage", "stage": "intel", "state": "done", "pct": 0}); return
+    live = os.path.join(OUT, "live.txt"); purls = os.path.join(OUT, "params", "urls.txt")
+    # 1) auto template selection per target's detected tech (-as) — CVEs/misconfig/exposure/CORS/CRLF/takeover…
+    if os.path.exists(live) and os.path.getsize(live):
+        feed("nuclei -as: auto-selecting templates per host tech (maintained detection logic)…")
+        _nuclei_stream([nuc, "-l", live, "-as", "-severity", "low,medium,high,critical",
+                        "-jsonl", "-o", os.path.join(OUT, "nuclei_intel.jsonl"), "-silent", "-nc", "-rl", "80"] + HDR_ARGS, "nuclei-as")
+    # 2) DAST fuzzing on discovered parameterised URLs — injection classes as templates, not hardcoded payloads
+    if os.path.exists(purls) and os.path.getsize(purls):
+        feed("nuclei -dast: fuzzing discovered parameters (SQLi/XSS/SSTI/LFI/redirect/CRLF via templates)…")
+        _nuclei_stream([nuc, "-l", purls, "-dast", "-severity", "low,medium,high,critical",
+                        "-jsonl", "-o", os.path.join(OUT, "nuclei_dast.jsonl"), "-silent", "-nc", "-rl", "60"] + HDR_ARGS, "nuclei-dast")
+    emit({"type": "stage", "stage": "intel", "state": "done", "pct": 100})
+    feed("nuclei intelligence complete", "good")
+
+def stage_brain():
+    emit({"type": "stage", "stage": "brain", "state": "run"})
+    feed("smart routing: forms, upload points, tech-specific tests…")
+    try:
+        _live0 = [l.strip() for l in open(os.path.join(OUT, "live.txt")) if l.strip()]
+    except Exception:
+        _live0 = []
+    check_session(_live0)
+    try:
+        live = [l.strip() for l in open(os.path.join(OUT, "live.txt")) if l.strip()]
+    except Exception:
+        live = []
+    sem = threading.Semaphore(6); th = []
+    def analyze(url):
+        with sem:
+            if not STATE["running"]: return
+            host = urllib.parse.urlsplit(url).netloc
+            sc, hd, body = _get(url, timeout=10)
+            upload = login = api = False
+            if body:
+                if UPLOAD_RE.search(body):
+                    upload = True
+                    emit({"type": "finding", "sev": "high", "host": host})
+                    feed(f"⇪ file-upload form on {host}", "high", host); bump("findings")
+                    run_uploadpwn(url, host)
+                if LOGIN_RE.search(body):
+                    login = True
+                    feed(f"🔑 login form on {host} — auth / default-creds candidate", "med", host)
+            ctype = str(hd.get("Content-Type", "")).lower()
+            if "json" in ctype or "graphql" in url.lower() or "/api" in url.lower():
+                api = True
+                feed(f"🔌 API/JSON surface on {host} — param/JSON + GraphQL introspection candidate", "info", host)
+            # cheap, no-dep scenario tests
+            cors_host_checks(url, host)
+            tech = " ".join(STATE["hosts"].get(host, {}).get("tech", [])).lower()
+            if "wordpress" in tech: run_nuclei_tags(url, host, "wordpress")
+            elif "joomla" in tech: run_nuclei_tags(url, host, "joomla")
+            elif "drupal" in tech: run_nuclei_tags(url, host, "drupal")
+            elif "tomcat" in tech: feed(f"Apache Tomcat on {host} — check /manager, CVE-2020-1938 (Ghostcat)", "med", host)
+            elif "jenkins" in tech: run_nuclei_tags(url, host, "jenkins")
+            score_host(host, upload=upload, login=login, api=api, tech=tech)
+    for url in live:
+        x = threading.Thread(target=analyze, args=(url,), daemon=True); x.start(); th.append(x)
+    for x in th: x.join()
+    emit({"type": "stage", "stage": "brain", "state": "done", "pct": 100})
+    feed("smart routing complete", "good")
+
+def preflight_feed():
+    need = ["subfinder", "assetfinder", "dnsx", "feroxbuster", "katana", "gau", "nuclei"]
+    present = [b for b in need if shutil.which(b)]
+    missing = [b for b in need if not shutil.which(b)]
+    hx = "httpx(pd)" if HTTPX else "httpx(MISSING)"
+    feed(f"tools ready: {', '.join(present)}, {hx}", "good")
+    if missing or not HTTPX:
+        feed(f"⚠ missing: {', '.join(missing + ([] if HTTPX else ['httpx']))} — run in WSL/Kali (python3), not Windows python", "med")
+
+def run_pipeline():
+    try:
+        preflight_feed()
+        subs = stage_enum()
+        if not STATE["running"]: return
+        res = stage_resolve(subs)
+        if not STATE["running"]: return
+        live = stage_probe(res)
+        if not STATE["running"]: return
+        # params + dirs in parallel (params is passive, dirs is heavy)
+        tp = threading.Thread(target=stage_params, args=(live,), daemon=True); tp.start()
+        stage_dirs(live)
+        tp.join()
+        if A.test and STATE["running"]:
+            stage_vulns()          # confirmed checks + signature-free differential anomaly probe
+            if STATE["running"]:
+                stage_brain()      # signal routing: forms, upload points, tech notes
+            if STATE["running"]:
+                stage_intel()      # nuclei auto-templates (-as) + DAST fuzzing — detection logic in maintained YAML
+        else:
+            for s in ("vulns", "brain", "intel"):
+                emit({"type": "stage", "stage": s, "state": "done", "pct": 0})
+            feed("active testing skipped (--no-test)", "info")
+        feed("★ pipeline complete", "good")
+    except Exception as e:
+        feed(f"pipeline error: {e}", "high")
+    finally:
+        emit({"type": "phase", "phase": "done"})
+
+def list_text(typ):
+    """On-demand full lists — everything discovered so far, as plain text."""
+    def readf(p):
+        try: return open(os.path.join(OUT, p)).read().strip()
+        except Exception: return ""
+    if typ == "subs":
+        rows = []
+        for h in sorted(STATE["hosts"].values(), key=lambda x: x["host"]):
+            rows.append(f'{h.get("map","offline"):9} {h["host"]}')
+        return "\n".join(rows) or "(none yet)"
+    if typ == "live":
+        return "\n".join(sorted(h.get("url", "") for h in STATE["hosts"].values() if h.get("map") == "live" and h.get("url"))) or "(none yet)"
+    if typ == "resolved":
+        return readf("resolved.txt") or "(none yet)"
+    if typ == "params":
+        return readf(os.path.join("params", "params.txt")) or "(none yet)"
+    if typ == "urls":       # full parameterised URLs
+        return readf(os.path.join("params", "urls.txt")) or "(none yet)"
+    if typ == "dirs":       # full discovered paths across all hosts
+        out = []
+        for h in sorted(STATE["hosts"].values(), key=lambda x: x["host"]):
+            base = h.get("url") or ("https://" + h["host"])
+            for d in h.get("dirs", []):
+                out.append(f'{d.get("code","")} {base.rstrip("/")}{d.get("path","")}')
+        return "\n".join(out) or "(none yet)"
+    return "(unknown list type)"
+
+def start_run(domain, cookie="", headers=None, uploadpwn=None, test=None):
+    if STATE.get("phase") == "running":
+        return False, "a scan is already running"
+    if not domain.strip():
+        return False, "no scope entered"
+    set_scope(domain, cookie, headers, uploadpwn, test)
+    reset_state()
+    emit({"type": "phase", "phase": "running", "domain": DOMAIN})
+    feed(f"◉ engagement started on {DOMAIN}", "good")
+    threading.Thread(target=run_pipeline, daemon=True).start()
+    return True, DOMAIN
+
+# ---------------- actions ----------------
+def action_nuclei(host):
+    nuc = shutil.which("nuclei")
+    if not nuc:
+        feed("nuclei missing", "high"); return
+    url = STATE["hosts"].get(host, {}).get("url") or ("https://" + host)
+    feed(f"nuclei → {host}", "info", host)
+    outp = os.path.join(OUT, f"nuclei_{_safe(url)}.txt")
+    def on(l):
+        l = l.strip()
+        if l:
+            sev = "crit" if "critical" in l.lower() else "high" if "high" in l.lower() else "med"
+            feed(f"nuclei: {l}", sev, host); bump("findings")
+    stream([nuc, "-u", url, "-severity", "low,medium,high,critical", "-silent", "-nc", "-o", outp], on, key="nuclei:" + host)
+
+def do_action(act, host):
+    if act == "kill":
+        p = PROCS.get(host)
+        if p:
+            p.terminate()
+            emit({"type": "hoststate", "host": host, "state": "killed"})
+            feed(f"killed scan on {host}", "med", host)
+    elif act == "rescan":
+        u = STATE["hosts"].get(host, {}).get("url") or ("https://" + host)
+        threading.Thread(target=ferox_host, args=(u, lambda: None), daemon=True).start()
+    elif act == "nuclei":
+        threading.Thread(target=action_nuclei, args=(host,), daemon=True).start()
+    elif act == "stop":
+        STATE["running"] = False
+        for p in list(PROCS.values()):
+            try: p.terminate()
+            except Exception: pass
+        feed("⏹ stopped by user", "med")
+
+# ---------------- web server ----------------
+DASH = r"""<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>recon-live · __DOMAIN__</title>
+<style>
+:root{--bg:#0d0f14;--panel:#141821;--panel2:#1b2130;--line:#252c3a;--line2:#333d4f;
+--text:#e6e8ee;--muted:#8b93a7;--faint:#5b6376;--amber:#e8a13a;--teal:#39bdae;--ok:#3fb950;--warn:#e5484d;--cyan:#4aa8ff;
+--mono:"JetBrains Mono",ui-monospace,Consolas,monospace;--sans:"Space Grotesk",system-ui,Segoe UI,sans-serif}
+*{box-sizing:border-box}html,body{margin:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px}
+a{color:var(--cyan)}
+header{display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:10;flex-wrap:wrap}
+.brand{font-family:var(--mono);font-weight:600;font-size:17px}
+.brand b{color:var(--amber)}
+.tgt{font-family:var(--mono);color:var(--muted);font-size:13px}
+.counts{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:6px 11px;min-width:64px;text-align:center}
+.kpi .n{font-family:var(--mono);font-weight:700;font-size:18px}
+.kpi .l{font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.5px}
+.kpi.live .n{color:var(--ok)}.kpi.dirs .n{color:var(--amber)}.kpi.params .n{color:var(--cyan)}.kpi.find .n{color:var(--warn)}
+.btn{font:inherit;font-size:12px;cursor:pointer;background:var(--panel2);color:var(--muted);border:1px solid var(--line);border-radius:7px;padding:6px 11px}
+.btn:hover{color:var(--text);border-color:var(--line2)}
+.btn.stop{color:var(--warn);border-color:var(--warn)}
+.pipe{display:flex;gap:8px;padding:10px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.stg{flex:1;min-width:130px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px 10px}
+.stg .h{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.stg .bar{height:5px;background:var(--panel2);border-radius:3px;margin-top:6px;overflow:hidden}
+.stg .bar i{display:block;height:100%;width:0;background:var(--teal);transition:width .3s}
+.stg.run{border-color:var(--teal)}.stg.run .h{color:var(--teal)}
+.stg.done .bar i{background:var(--ok)}.stg.done .h{color:var(--ok)}
+main{display:grid;grid-template-columns:1fr 380px;gap:1px;background:var(--line);min-height:calc(100vh - 150px)}
+.left,.right{background:var(--bg);padding:14px 18px;overflow:auto}
+.toolbar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+.toolbar input[type=text]{flex:1;min-width:160px;font-family:var(--mono);font-size:13px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.chip{font-family:var(--mono);font-size:12px;cursor:pointer;background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 11px;color:var(--muted)}
+.chip.on{border-color:var(--amber);color:var(--amber)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.5px;padding:6px 8px;border-bottom:1px solid var(--line);cursor:pointer}
+td{padding:7px 8px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:top}
+tr.host{cursor:pointer}tr.host:hover{background:var(--panel)}
+.code{font-family:var(--mono);font-weight:700;font-size:12px;padding:2px 7px;border-radius:6px;display:inline-block;min-width:34px;text-align:center}
+.c2{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
+.c3{background:color-mix(in srgb,var(--teal) 20%,transparent);color:var(--teal)}
+.c4{background:color-mix(in srgb,var(--amber) 20%,transparent);color:var(--amber)}
+.c5{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.c0{background:var(--panel2);color:var(--faint)}
+.host-n{font-family:var(--mono);font-size:13px}
+.title{color:var(--muted);font-size:12px}
+.tech{display:inline-block;font-size:10px;font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 6px;margin:1px 2px 0 0;color:var(--muted)}
+.st{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:6px}
+.st.scanning{color:var(--teal)}.st.done{color:var(--ok)}.st.stalled,.st.killed{color:var(--warn)}.st.up{color:var(--faint)}
+.hbar{height:4px;background:var(--panel2);border-radius:2px;margin-top:3px;overflow:hidden;min-width:70px}
+.hbar i{display:block;height:100%;background:var(--teal);width:0;transition:width .4s}
+.spin{display:inline-block;animation:sp 1s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
+.acts{white-space:nowrap}
+.acts button{font-size:11px;padding:3px 7px;margin-left:3px}
+.exp{background:var(--panel);border-left:2px solid var(--teal)}
+.exp .grp{margin:4px 0}
+.exp .dir{font-family:var(--mono);font-size:12px;padding:1px 0}
+.right h3{margin:0 0 8px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+.feed{display:flex;flex-direction:column;gap:4px}
+.fi{font-family:var(--mono);font-size:12px;padding:5px 8px;border-radius:6px;background:var(--panel);border-left:2px solid var(--line)}
+.fi.good{border-left-color:var(--ok)}.fi.med{border-left-color:var(--amber)}.fi.high,.fi.crit{border-left-color:var(--warn)}
+.fi .t{color:var(--faint);font-size:10px}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+.hide{display:none!important}
+@keyframes pulse{0%{transform:scale(1)}35%{transform:scale(1.3);color:var(--ok)}100%{transform:scale(1)}}
+.kpi .n.bump{animation:pulse .55s ease}
+@keyframes flashrow{0%{background:color-mix(in srgb,var(--teal) 34%,transparent)}100%{background:transparent}}
+tr.host.flash{animation:flashrow 1.1s ease}
+.radar{position:relative;width:13px;height:13px;border-radius:50%;background:var(--faint);flex:none;transition:background .2s}
+.radar.on{background:var(--ok)}
+.radar.on::after{content:"";position:absolute;inset:-5px;border:2px solid var(--ok);border-radius:50%;animation:ring .8s ease-out}
+@keyframes ring{0%{transform:scale(.5);opacity:.9}100%{transform:scale(2.4);opacity:0}}
+#lists{position:fixed;inset:0;background:rgba(8,10,14,.9);z-index:90;display:none;align-items:center;justify-content:center}
+#lists.on{display:flex}
+#lists .card{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:20px;width:min(920px,94vw);height:min(82vh,760px);display:flex;flex-direction:column}
+#lists .tabs2{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+#lists .t2{font-family:var(--mono);font-size:12px;cursor:pointer;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:6px 11px;color:var(--muted)}
+#lists .t2.on{border-color:var(--amber);color:var(--amber)}
+#lists textarea{flex:1;width:100%;font-family:var(--mono);font-size:12px;line-height:1.5;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:11px;resize:none;box-sizing:border-box}
+#lists .bar2{display:flex;gap:8px;margin-top:10px;align-items:center}
+#scope{position:fixed;inset:0;background:rgba(8,10,14,.97);z-index:100;display:flex;align-items:center;justify-content:center}
+#scope .card{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:28px;width:min(560px,92vw)}
+#scope h1{font-family:var(--mono);font-size:24px;margin:0 0 4px}#scope h1 b{color:var(--amber)}
+#scope p{color:var(--muted);margin:0 0 14px;font-size:13px}
+#scope label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
+#scope input[type=text],#scope textarea{width:100%;font-family:var(--mono);font-size:14px;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:11px;box-sizing:border-box}
+#scope .go{margin-top:18px;width:100%;font-size:15px;font-weight:700;background:var(--amber);color:#111;border:0;border-radius:10px;padding:13px;cursor:pointer}
+#scope .go:hover{filter:brightness(1.06)}
+#scope .chk{display:flex;align-items:center;gap:8px;margin-top:12px;color:var(--muted);font-size:13px}
+</style></head>
+<body>
+<div id="scope">
+  <div class="card">
+    <h1>recon<b>·</b>live</h1>
+    <p>Enter a scope. Every brain — enum, resolve, probe, dirs, params, vulns, upload — spins up and this page becomes a live orchestration.</p>
+    <label>Target domain</label>
+    <input type="text" id="s_domain" placeholder="example.com" autofocus>
+    <label>Cookie <span style="color:var(--faint)">— optional, for authenticated scans</span></label>
+    <input type="text" id="s_cookie" placeholder="SESSION=...; token=...">
+    <label>Extra headers <span style="color:var(--faint)">— optional, one per line</span></label>
+    <textarea id="s_headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
+    <label>uploadpwn command <span style="color:var(--faint)">— optional, {url} placeholder</span></label>
+    <input type="text" id="s_upload" placeholder="auto: ~/tools/uploadpwn/uploadpwn.py">
+    <label class="chk"><input type="checkbox" id="s_test" checked> Active testing (LFI/SSTI/upload/nuclei) — authorized scope only</label>
+    <button class="go" id="s_go">◉ Launch orchestration</button>
+    <div id="s_msg" style="color:var(--warn);font-size:12px;margin-top:8px"></div>
+  </div>
+</div>
+<header>
+  <span class="radar" id="radar" title="discovery activity"></span>
+  <span class="brand">recon<b>·</b>live</span>
+  <span class="tgt" id="tgt">__DOMAIN__</span>
+  <span class="tgt" id="elapsed"></span>
+  <div class="counts">
+    <div class="kpi"><div class="n" id="c_subs">0</div><div class="l">mapped</div></div>
+    <div class="kpi"><div class="n" id="c_resolved">0</div><div class="l">resolves</div></div>
+    <div class="kpi live"><div class="n" id="c_live">0</div><div class="l">live</div></div>
+    <div class="kpi dirs"><div class="n" id="c_dirs">0</div><div class="l">dirs</div></div>
+    <div class="kpi params"><div class="n" id="c_params">0</div><div class="l">params</div></div>
+    <div class="kpi find"><div class="n" id="c_findings">0</div><div class="l">findings</div></div>
+  </div>
+  <button class="btn" id="listsBtn">▤ Lists</button>
+  <button class="btn stop" id="stopBtn">Stop</button>
+</header>
+<div id="lists"><div class="card">
+  <div class="tabs2" id="listTabs">
+    <span class="t2 on" data-t="subs">subdomains</span>
+    <span class="t2" data-t="live">live URLs</span>
+    <span class="t2" data-t="resolved">resolved</span>
+    <span class="t2" data-t="params">params</span>
+    <span class="t2" data-t="urls">param URLs</span>
+    <span class="t2" data-t="dirs">directories</span>
+  </div>
+  <textarea id="listText" readonly spellcheck="false"></textarea>
+  <div class="bar2">
+    <button class="btn" id="listCopy">Copy</button>
+    <button class="btn" id="listDownload">Download</button>
+    <span id="listCount" style="color:var(--muted)"></span>
+    <button class="btn" id="listClose" style="margin-left:auto">Close</button>
+  </div>
+</div></div>
+<div class="pipe" id="pipe"></div>
+<main>
+  <section class="left">
+    <div class="toolbar">
+      <input type="text" id="q" placeholder="filter host / title / tech / path…">
+      <span class="chip on" data-s2="live">live</span><span class="chip on" data-s2="resolved">resolved</span><span class="chip on" data-s2="offline">offline</span>
+      <span style="color:var(--faint)">|</span>
+      <span class="chip on" data-f="2xx">2xx</span><span class="chip on" data-f="3xx">3xx</span>
+      <span class="chip on" data-f="4xx">4xx</span><span class="chip on" data-f="5xx">5xx</span>
+      <span class="chip" data-f="dirs">has dirs</span>
+    </div>
+    <table><thead><tr>
+      <th data-s="status">code</th><th data-s="host">host</th><th data-s="title">title / tech</th>
+      <th data-s="dirs">dirs</th><th data-s="params">params</th><th data-s="score">score</th><th data-s="state">state</th><th>actions</th>
+    </tr></thead><tbody id="rows"></tbody></table>
+  </section>
+  <aside class="right">
+    <h3>findings feed</h3>
+    <div class="feed" id="feed"></div>
+  </aside>
+</main>
+<script>
+const $=s=>document.querySelector(s), rowsEl=$("#rows"), feedEl=$("#feed");
+let ST={hosts:{},counts:{},stages:{},feed:[],started:Date.now()/1000};
+const STAGES=["enum","resolve","probe","dirs","params","vulns","brain","intel"];
+const filters={q:"",set:new Set(["2xx","3xx","4xx","5xx"]),surf:new Set(["live","resolved","offline"]),dirs:false,sort:"score"};
+
+function cls(code){const c=parseInt(code);if(c>=200&&c<300)return"c2";if(c<400)return"c3";if(c<500)return"c4";if(c<600)return"c5";return"c0";}
+function esc(s){return (s||"").replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));}
+
+function renderPipe(){
+  $("#pipe").innerHTML=STAGES.map(s=>{const st=ST.stages[s]||{state:"pending",pct:0};
+    return `<div class="stg ${st.state}"><div class="h"><span>${s}</span><span>${st.state==="done"?"✓":st.pct?st.pct+"%":st.state}</span></div><div class="bar"><i style="width:${st.state==="done"?100:st.pct||0}%"></i></div></div>`;}).join("");
+}
+let _prevC={};
+function renderCounts(){for(const k of["subs","resolved","live","dirs","params","findings"]){const e=$("#c_"+k);if(!e)continue;const v=ST.counts[k]||0;e.textContent=v;if(v>(_prevC[k]||0)){e.classList.remove("bump");void e.offsetWidth;e.classList.add("bump");}_prevC[k]=v;}}
+function hmap(h){return h.map || (h.url?"live":"offline");}
+let _radT=null;
+function ping(){const r=$("#radar");if(!r)return;r.classList.add("on");clearTimeout(_radT);_radT=setTimeout(()=>r.classList.remove("on"),800);}
+const flashHosts=new Set();
+function firstCode(h){const c=(h.codes||String(h.status||"")).split(",").filter(Boolean);return c[c.length-1]||h.status||0;}
+function passFilter(h){
+  const m=hmap(h);
+  if(!filters.surf.has(m))return false;                 // surface filter (live/resolved/offline)
+  if(m==="live"){                                        // status bands only apply to live hosts
+    const code=parseInt(firstCode(h))||0; const band=code>=500?"5xx":code>=400?"4xx":code>=300?"3xx":code>=200?"2xx":null;
+    if(band&&!filters.set.has(band))return false;
+  }
+  if(filters.dirs&&!(h.dirs&&h.dirs.length))return false;
+  if(filters.q){const q=filters.q.toLowerCase();
+    const hay=(h.host+" "+(h.title||"")+" "+(h.tech||[]).join(" ")+" "+(h.dirs||[]).map(d=>d.path).join(" ")).toLowerCase();
+    if(!hay.includes(q))return false;}
+  return true;
+}
+function sortHosts(arr){const s=filters.sort;
+  return arr.sort((a,b)=>{
+    if(s==="status")return (parseInt(firstCode(a))||999)-(parseInt(firstCode(b))||999);
+    if(s==="score")return (b.score||0)-(a.score||0);
+    if(s==="dirs")return (b.dirs?.length||0)-(a.dirs?.length||0);
+    if(s==="params")return (b.params?.length||0)-(a.params?.length||0);
+    return (a.host||"").localeCompare(b.host||"");});
+}
+let expanded=new Set();
+function renderRows(){
+  const arr=sortHosts(Object.values(ST.hosts).filter(passFilter));
+  rowsEl.innerHTML=arr.map(h=>{
+    const code=firstCode(h);
+    const tech=(h.tech||[]).slice(0,6).map(t=>`<span class="tech">${esc(t)}</span>`).join("");
+    const stt=h.state||"up";
+    const stlabel=stt==="scanning"?`<span class="spin">⟳</span> ${h.pct||0}%${h.elapsed?" · "+h.elapsed+"s":""}`:stt;
+    const stbar=stt==="scanning"?`<div class="hbar"><i style="width:${h.pct||0}%"></i></div>`:"";
+    const m=hmap(h);
+    const badge = m==="live" ? `<span class="code ${cls(code)}">${esc(String(code))}</span>`
+      : m==="resolved" ? `<span class="code c3" title="resolves, no HTTP">DNS</span>`
+      : `<span class="code c0" title="enumerated, no DNS">DEAD</span>`;
+    const fl=flashHosts.has(h.host)?" flash":"";
+    let row=`<tr class="host${fl}" data-h="${esc(h.host)}"><td>${badge}</td>`+
+      `<td><span class="host-n">${esc(h.host)}</span></td>`+
+      `<td><div class="title">${esc((h.title||"").slice(0,60))}</div>${tech}</td>`+
+      `<td>${h.dirs?.length||0}</td><td>${h.params?.length||0}</td>`+
+      `<td><b style="color:${(h.score||0)>=12?'var(--warn)':(h.score||0)>=6?'var(--amber)':'var(--faint)'}">${h.score||0}</b></td>`+
+      `<td><span class="st ${stt}">${stlabel}</span>${stbar}</td>`+
+      `<td class="acts"><button class="btn" data-a="kill">kill</button><button class="btn" data-a="rescan">rescan</button><button class="btn" data-a="nuclei">nuclei</button><a class="btn" href="${esc(h.url||('https://'+h.host))}" target="_blank">open</a></td></tr>`;
+    if(expanded.has(h.host)){
+      const dirs=(h.dirs||[]).map(d=>`<div class="dir"><span class="code ${cls(d.code)}">${d.code}</span> ${esc(d.path)} <span style="color:var(--faint)">${d.size??""}</span></div>`).join("")||'<span style="color:var(--faint)">no dirs yet</span>';
+      const ps=(h.params||[]).map(p=>`<span class="tech">${esc(p)}</span>`).join("")||'<span style="color:var(--faint)">none</span>';
+      row+=`<tr class="exp"><td colspan="8"><div class="grp"><b>dirs (${h.dirs?.length||0}):</b><br>${dirs}</div><div class="grp"><b>params:</b> ${ps}</div></td></tr>`;
+    }
+    return row;
+  }).join("");
+  flashHosts.clear();
+}
+function addFeed(f){
+  const d=new Date((f.ts||Date.now()/1000)*1000).toLocaleTimeString();
+  const el=document.createElement("div");el.className="fi "+(f.sev||"info");
+  el.innerHTML=`<span class="t">${d}</span> ${esc(f.msg)}`;
+  feedEl.prepend(el); while(feedEl.children.length>200)feedEl.lastChild.remove();
+}
+let rafP=null;function scheduleRender(){if(rafP)return;rafP=setTimeout(()=>{rafP=null;renderRows();renderCounts();renderPipe();},200);}
+
+function setPhase(ph){
+  const sc=$("#scope");
+  if(ph==="idle"){sc.classList.remove("hide");}
+  else{sc.classList.add("hide");}
+  if(ph==="done"){document.querySelectorAll("#pipe .stg:not(.done)").forEach(e=>{});}
+}
+function launch(){
+  const dom=$("#s_domain").value.trim();
+  if(!dom){$("#s_msg").textContent="enter a domain";return;}
+  $("#s_go").textContent="◉ launching…";
+  fetch("/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({domain:dom,cookie:$("#s_cookie").value.trim(),headers:$("#s_headers").value,
+      uploadpwn:$("#s_upload").value.trim(),test:$("#s_test").checked})})
+   .then(r=>r.json()).then(d=>{ if(!d.ok){$("#s_msg").textContent=d.msg||"failed";$("#s_go").textContent="◉ Launch orchestration";}
+     else{$("#tgt").textContent=d.msg;setPhase("running");} })
+   .catch(e=>{$("#s_msg").textContent=""+e;$("#s_go").textContent="◉ Launch orchestration";});
+}
+function apply(ev){
+  const t=ev.type;
+  if(t==="phase"){ST.phase=ev.phase; if(ev.domain)$("#tgt").textContent=ev.domain; setPhase(ev.phase); return;}
+  if(t==="snapshot"){ST=ev.state;ST.feed?.forEach(addFeed);setPhase(ST.phase||"idle");scheduleRender();return;}
+  if(t==="stage")ST.stages[ev.stage]={state:ev.state,pct:ev.pct??ST.stages[ev.stage]?.pct??0};
+  else if(t==="count")ST.counts[ev.key]=ev.value;
+  else if(t==="host"){const h=ST.hosts[ev.host]||(ST.hosts[ev.host]={host:ev.host,dirs:[],params:[]});Object.assign(h,ev); if(ev.map==="live"){flashHosts.add(ev.host);ping();}}
+  else if(t==="hoststate"){const h=ST.hosts[ev.host]||(ST.hosts[ev.host]={host:ev.host,dirs:[],params:[]});h.state=ev.state;if(ev.elapsed!=null)h.elapsed=ev.elapsed;if(ev.pct!=null)h.pct=ev.pct;}
+  else if(t==="dir"){const h=ST.hosts[ev.host]||(ST.hosts[ev.host]={host:ev.host,dirs:[],params:[]});h.dirs.push({path:ev.path,code:ev.code,size:ev.size});flashHosts.add(ev.host);ping();}
+  else if(t==="param"){const h=ST.hosts[ev.host]||(ST.hosts[ev.host]={host:ev.host,dirs:[],params:[]});if(!h.params.includes(ev.name))h.params.push(ev.name);ping();}
+  else if(t==="hostscore"){const h=ST.hosts[ev.host]||(ST.hosts[ev.host]={host:ev.host,dirs:[],params:[]});h.score=ev.score;}
+  else if(t==="finding"){if(ev.host)flashHosts.add(ev.host);ping();}
+  else if(t==="feed")addFeed(ev);
+  scheduleRender();
+}
+const es=new EventSource("/events");
+es.onmessage=e=>{try{apply(JSON.parse(e.data));}catch(err){}};
+
+function ctl(action,host){fetch("/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,host})});}
+rowsEl.addEventListener("click",e=>{
+  const b=e.target.closest("button[data-a]");
+  if(b){e.stopPropagation();const h=b.closest("tr").dataset.h;ctl(b.dataset.a,h);return;}
+  const tr=e.target.closest("tr.host");if(tr){const h=tr.dataset.h;expanded.has(h)?expanded.delete(h):expanded.add(h);renderRows();}
+});
+$("#stopBtn").onclick=()=>ctl("stop","");
+// ---- Lists panel: dump everything discovered, anytime ----
+let listType="subs";
+function loadList(t){listType=t;
+  document.querySelectorAll("#listTabs .t2").forEach(x=>x.classList.toggle("on",x.dataset.t===t));
+  $("#listText").value="loading…";
+  fetch("/list?type="+t).then(r=>r.text()).then(txt=>{
+    $("#listText").value=txt;
+    const n=(txt.trim()&&txt!=="(none yet)")?txt.trim().split("\n").length:0;
+    $("#listCount").textContent=n+" entries";});}
+$("#listsBtn").onclick=()=>{$("#lists").classList.add("on");loadList(listType);};
+$("#listClose").onclick=()=>$("#lists").classList.remove("on");
+document.querySelectorAll("#listTabs .t2").forEach(x=>x.onclick=()=>loadList(x.dataset.t));
+$("#listCopy").onclick=()=>{navigator.clipboard.writeText($("#listText").value);$("#listCopy").textContent="copied";setTimeout(()=>$("#listCopy").textContent="Copy",1000);};
+$("#listDownload").onclick=()=>{const blob=new Blob([$("#listText").value],{type:"text/plain"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="recon-"+listType+".txt";a.click();};
+$("#s_go").onclick=launch;
+$("#s_domain").addEventListener("keydown",e=>{if(e.key==="Enter")launch();});
+$("#q").oninput=e=>{filters.q=e.target.value;renderRows();};
+document.querySelectorAll(".chip").forEach(c=>c.onclick=()=>{
+  if(c.dataset.s2){const s=c.dataset.s2; filters.surf.has(s)?filters.surf.delete(s):filters.surf.add(s); c.classList.toggle("on");}
+  else{const f=c.dataset.f; if(f==="dirs"){filters.dirs=!filters.dirs;c.classList.toggle("on",filters.dirs);}
+    else{filters.set.has(f)?filters.set.delete(f):filters.set.add(f);c.classList.toggle("on");}}
+  renderRows();});
+document.querySelectorAll("th[data-s]").forEach(th=>th.onclick=()=>{filters.sort=th.dataset.s;renderRows();});
+setInterval(()=>{const s=Math.floor(Date.now()/1000-(ST.started||Date.now()/1000));$("#elapsed").textContent="⏱ "+Math.floor(s/60)+"m "+(s%60)+"s";},1000);
+renderPipe();
+</script></body></html>"""
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, code, ctype, body):
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache"); self.end_headers()
+        self.wfile.write(body if isinstance(body, bytes) else body.encode())
+    def do_GET(self):
+        if self.path == "/favicon.ico":
+            self._send(204, "image/x-icon", b"")
+        elif self.path == "/" or self.path.startswith("/index"):
+            self._send(200, "text/html; charset=utf-8", DASH.replace("__DOMAIN__", html.escape(DOMAIN)))
+        elif self.path == "/state":
+            self._send(200, "application/json", json.dumps(STATE))
+        elif self.path.startswith("/list"):
+            q = urllib.parse.urlparse(self.path).query
+            typ = (urllib.parse.parse_qs(q).get("type", ["live"])[0])
+            self._send(200, "text/plain; charset=utf-8", list_text(typ))
+        elif self.path == "/events":
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "keep-alive"); self.end_headers()
+            q = queue.Queue(maxsize=1000)
+            with buslock:
+                subs_q.append(q)
+            try:
+                self.wfile.write(b"retry: 2000\n\n")
+                self.wfile.write(("data: " + json.dumps({"type": "snapshot", "state": STATE}) + "\n\n").encode())
+                self.wfile.flush()
+                while True:
+                    ev = q.get()
+                    self.wfile.write(("data: " + json.dumps(ev) + "\n\n").encode()); self.wfile.flush()
+            except Exception:
+                pass
+            finally:
+                with buslock:
+                    if q in subs_q: subs_q.remove(q)
+        else:
+            self._send(404, "text/plain", "nope")
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        data = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        if self.path == "/control":
+            do_action(data.get("action", ""), data.get("host", ""))
+            self._send(200, "application/json", b'{"ok":true}')
+        elif self.path == "/start":
+            hdrs = [h for h in (data.get("headers") or "").splitlines() if h.strip()]
+            ok, msg = start_run(data.get("domain", ""), data.get("cookie", ""), hdrs,
+                                data.get("uploadpwn") or None, bool(data.get("test", True)))
+            self._send(200, "application/json", json.dumps({"ok": ok, "msg": msg}))
+        else:
+            self._send(404, "text/plain", "nope")
+
+def main():
+    if not HTTPX:
+        print("WARNING: ProjectDiscovery httpx not found in ~/go/bin (python httpx will not work).")
+    srv = ThreadingHTTPServer(("127.0.0.1", A.port), H)
+    url = f"http://127.0.0.1:{A.port}"
+    if A.domain:                                  # CLI scope -> auto-start
+        start_run(A.domain, A.cookie, A.header, A.uploadpwn, A.test)
+        print(f"\n  recon-live  →  {url}\n  target: {DOMAIN}   out: {OUT}\n")
+    else:                                         # no scope -> wait for the page
+        STATE["phase"] = "idle"
+        print(f"\n  recon-live  →  {url}\n  open the page and enter a scope to begin.\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        do_action("stop", ""); print("\nstopped.")
+
+if __name__ == "__main__":
+    main()
