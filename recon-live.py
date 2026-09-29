@@ -390,8 +390,18 @@ def stage_ports(resolved):
         l = l.strip()
         if l: out.append(l)
     stream(["naabu", "-l", os.path.join(OUT, "resolved.txt"), "-top-ports", str(A.top_ports),
-            "-s", "c", "-silent", "-retries", "1"], on)
-    out = sorted(set(out)) or resolved
+            "-s", "c", "-silent", "-retries", "1", "-timeout", "1500"], on)
+    # ALWAYS union naabu output with the obvious web ports so probe never loses 80/443/8080/…
+    # even when naabu yields nothing (privilege/scan-type quirks) — no stall, no lost coverage.
+    DEFAULT_WEB_PORTS = ("80", "443", "8080", "8443", "8000")
+    endpoints = set(out)
+    for h in resolved:
+        h = h.strip()
+        if not h: continue
+        host = h.rsplit(":", 1)[0] if h.rsplit(":", 1)[-1].isdigit() else h   # drop any existing :port
+        for p in DEFAULT_WEB_PORTS:
+            endpoints.add(f"{host}:{p}")
+    out = sorted(endpoints) or sorted(set(resolved))
     open(os.path.join(OUT, "ports.txt"), "w").write("\n".join(out) + "\n")
     mark_stage("ports", count=len(out))
     emit({"type": "stage", "stage": "ports", "state": "done", "pct": 100})
@@ -424,6 +434,37 @@ def stage_probe(resolved):
             live.append(url); bump("live")
     stream([HTTPX, "-l", pin, "-json", "-silent",
             "-sc", "-title", "-td", "-fr", "-nc"] + HDR_ARGS, on)
+    # Robustness fallback: if httpx yielded nothing (parsing quirk, scheme guess, transient
+    # failure) but the targets are actually up, probe each host directly on http+https so a
+    # live host is NEVER silently dropped and the whole detection pipeline can't run on air.
+    if not live:
+        try:
+            targets = [l.strip() for l in open(pin) if l.strip()]
+        except Exception:
+            targets = []
+        if targets:
+            feed("httpx returned 0 live — direct http/https fallback probe…", "med")
+        seen_fb = set()
+        for t in targets:
+            has_port = t.rsplit(":", 1)[-1].isdigit()
+            cands = [t if "://" in t else ("http://" + t)]
+            if not has_port:
+                cands = ["https://" + t, "http://" + t]
+            for cu in cands:
+                if cu in seen_fb: continue
+                seen_fb.add(cu)
+                sc, hd, body = _get(cu, opener=_NOREDIR, timeout=8)
+                if sc is not None:
+                    host = urllib.parse.urlsplit(cu).netloc
+                    title = ""
+                    try:
+                        mt = _re.search(rb"<title[^>]*>(.*?)</title>", body or b"", _re.I | _re.S)
+                        if mt: title = mt.group(1).decode("utf-8", "replace").strip()[:120]
+                    except Exception: pass
+                    emit({"type": "host", "host": host, "url": cu, "status": sc,
+                          "codes": str(sc), "title": title, "tech": [], "map": "live"})
+                    live.append(cu); bump("live")
+                    break   # first responsive scheme wins for this host
     open(os.path.join(OUT, "live.txt"), "w").write("\n".join(sorted(set(live))) + "\n")
     mark_stage("probe", count=len(live))
     emit({"type": "stage", "stage": "probe", "state": "done", "pct": 100})
@@ -1162,10 +1203,27 @@ def stage_intel():
     subs_all = os.path.join(OUT, "subs.txt")
     if shutil.which("subzy") and os.path.exists(subs_all):
         feed("subzy: subdomain-takeover sweep…")
-        def _sz(l):
-            if "VULNERABLE" in l.upper():
-                finding("high", "takeover", _host_of(l), f"subdomain takeover: {l.strip()[:140]}")
-        stream(["subzy", "run", "--targets", subs_all, "--hide_fails"], _sz, key="subzy")
+        # Parse subzy's JSON output (only genuine vulnerable results) — NOT stdout, whose
+        # banner/help text ("...potentially vulnerable subdomains (--hide_fails)") caused a
+        # false-positive when matched case-insensitively for "VULNERABLE".
+        sz_out = os.path.join(OUT, "subzy.json")
+        try:
+            if os.path.exists(sz_out): os.remove(sz_out)
+        except Exception: pass
+        stream(["subzy", "run", "--targets", subs_all, "--hide_fails", "--vuln",
+                "--output", sz_out], lambda l: None, key="subzy")
+        try:
+            data = json.load(open(sz_out)) if os.path.exists(sz_out) else []
+        except Exception:
+            data = []
+        for row in (data or []):
+            if not isinstance(row, dict): continue
+            vuln = row.get("vulnerable")
+            if vuln in (True, "true", "True", 1):
+                tgt = row.get("subdomain") or row.get("domain") or row.get("host") or ""
+                eng = row.get("engine") or row.get("service") or row.get("fingerprint") or ""
+                finding("high", "takeover", _host_of(tgt),
+                        f"subdomain takeover: {tgt} ({eng})"[:140], tgt)
     elif os.path.exists(subs_all) and os.path.getsize(subs_all):
         feed("nuclei takeover templates: subdomain-takeover sweep…")
         _nuclei_stream([nuc, "-l", subs_all, "-tags", "takeover", "-jsonl",
@@ -1186,14 +1244,19 @@ def stage_intel():
             if A.cookie: sq += ["--cookie", A.cookie]
             def _sq(l):
                 low = l.lower()
-                if "is vulnerable" in low or "appears to be injectable" in low or "injectable" in low and "not" not in low:
+                # positive markers only; guard against negatives like
+                # "do not appear to be injectable" / "not injectable"
+                if "not" in low or "no parameter" in low:
+                    return
+                if "is vulnerable" in low or "appears to be injectable" in low or "parameter" in low and "injectable" in low:
                     finding("crit", "sqli", DOMAIN, f"sqlmap: {l.strip()[:150]}")
             stream(sq, _sq, key="sqlmap")
     # 4) dalfox XSS confirmation on discovered params (optional — only if installed)
     if shutil.which("dalfox") and os.path.exists(purls) and os.path.getsize(purls):
         feed("dalfox: confirming reflected/DOM XSS on discovered params…")
         def _dx(l):
-            if "[POC]" in l or "[VULN]" in l:
+            # require a real PoC/VULN line that carries an http(s) target — never banner/help text
+            if ("[POC]" in l or "[VULN]" in l) and _re.search(r"https?://", l):
                 finding("high", "xss", _host_of(l), f"dalfox XSS confirmed: {l.strip()[:150]}")
         stream(["dalfox", "file", purls, "--silence", "--no-color", "--skip-bav"] + HDR_ARGS, _dx, key="dalfox")
     mark_stage("intel")
