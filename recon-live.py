@@ -260,7 +260,13 @@ def dir_host_done(host):
     if A.fresh: return False
     return bool(manifest_load().get("stages", {}).get("dirs", {}).get("hosts", {}).get(host))
 
+_FIND_SEEN = set(); _find_lock = threading.Lock()
 def finding(sev, kind, host, msg, url=""):
+    # dedup identical findings (the same vuln can be reached via both crawl + brute paths)
+    dk = (kind, host, url, msg)
+    with _find_lock:
+        if dk in _FIND_SEEN: return
+        _FIND_SEEN.add(dk)
     rec = {"ts": time.time(), "sev": sev, "kind": kind, "host": host, "msg": msg, "url": url}
     try:
         with open(os.path.join(OUT, "findings.jsonl"), "a") as f:
