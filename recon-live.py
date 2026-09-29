@@ -595,13 +595,23 @@ def stage_dirs(live):
 def stage_params(live):
     emit({"type": "stage", "stage": "params", "state": "run"})
     feed("discovering parameters (katana/gau/waybackurls)…")
-    urls = set(); params = set(); per_host = {}; js = set()
+    urls = set(); params = set(); per_host = {}; js = set(); pages = set()
+    _page_seen = set()
     def add_url(l):
         l = l.strip()
-        try: netloc = urllib.parse.urlsplit(l).netloc.lower()
+        try:
+            sp = urllib.parse.urlsplit(l); netloc = sp.netloc.lower()
         except Exception: return
         hostonly = netloc.split(":", 1)[0]   # ignore port so IP:port / host:port targets stay in scope
         if netloc and hostonly != DOMAIN and not hostonly.endswith("." + DOMAIN): return   # scope guard
+        # Record every in-scope crawled page path as a "dir" so the brain analyzes it
+        # (exposure/access-control/forms) even when ferox's recursion misses it. Crawler
+        # discovery (katana) is deterministic; ferox link-scraping is not.
+        if netloc and sp.path and sp.path != "/":
+            pk = (netloc, sp.path)
+            if pk not in _page_seen:
+                _page_seen.add(pk); pages.add(netloc + sp.path)
+                emit({"type": "dir", "host": netloc, "path": sp.path, "code": None})
         if l.split("?", 1)[0].lower().endswith(".js"):
             js.add(l); return
         if "?" not in l or "=" not in l: return
@@ -625,6 +635,7 @@ def stage_params(live):
     open(os.path.join(OUT, "params", "urls.txt"), "w").write("\n".join(sorted(urls)) + "\n")
     open(os.path.join(OUT, "params", "params.txt"), "w").write("\n".join(sorted(params)) + "\n")
     open(os.path.join(OUT, "params", "js.txt"), "w").write("\n".join(sorted(js)) + "\n")
+    open(os.path.join(OUT, "params", "pages.txt"), "w").write("\n".join(sorted(pages)) + "\n")
     for host, d in per_host.items():
         hd = host_dir(host)
         open(os.path.join(hd, "urls.txt"), "w").write("\n".join(sorted(d["urls"])) + "\n")
