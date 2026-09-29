@@ -33,6 +33,7 @@ ap.add_argument("--max-requests", dest="max_requests", type=int, default=0,
                 help="global cap on active HTTP test requests (0 = unlimited)")
 ap.add_argument("--notify", default="", help="webhook URL POSTed a JSON payload on each high/crit finding")
 ap.add_argument("--diff", action="store_true", help="also write DIFF.md: new hosts/findings vs the previous run of this domain")
+ap.add_argument("--screens", action="store_true", help="capture a screenshot of every live host (httpx -ss, uses system chromium)")
 ap.set_defaults(test=True)
 A = ap.parse_args()
 A.time_limit = A.time_limit or ("45s" if A.fast else "3m")
@@ -111,6 +112,15 @@ def reset_state():
     STATE["counts"] = {k: 0 for k in COUNT_KEYS}
     STATE["hosts"] = {}; STATE["feed"] = []; STATE["running"] = True
 
+def _persist_state():
+    """Periodically dump STATE to disk so a crash doesn't lose the dashboard view."""
+    while STATE.get("running"):
+        try: json.dump(STATE, open(os.path.join(OUT, "state.json"), "w"))
+        except Exception: pass
+        time.sleep(5)
+    try: json.dump(STATE, open(os.path.join(OUT, "state.json"), "w"))
+    except Exception: pass
+
 def emit(ev):
     ev.setdefault("ts", time.time())
     with buslock:
@@ -135,7 +145,7 @@ def _apply(ev):
         STATE["counts"][ev["key"]] = ev["value"]
     elif t == "host":
         h = STATE["hosts"].setdefault(ev["host"], {"host": ev["host"], "dirs": [], "params": []})
-        for k in ("url", "status", "codes", "title", "tech", "map"):
+        for k in ("url", "status", "codes", "title", "tech", "map", "shot"):
             if k in ev:
                 h[k] = ev[k]
     elif t == "hoststate":
@@ -614,6 +624,42 @@ def _redirects_to(loc, host):
             return rest == host or rest[:len(host) + 1] in (host + "/", host + ":", host + "?", host + "#")
     return False
 
+def _endpoint_score(url):
+    """Cheap attack-surface score from data already gathered (params/dirs/status) —
+    used to order the vuln queue so the best endpoints get tested before the cap bites."""
+    h = urllib.parse.urlsplit(url).netloc
+    hd = STATE["hosts"].get(h, {})
+    s = len(hd.get("params", [])) * 2 + len(hd.get("dirs", []))
+    for d in hd.get("dirs", []):
+        if INTERESTING_PATH.search(d.get("path", "")): s += 3
+    try:
+        code = int(str(hd.get("status") or 0).split(",")[-1])
+        if code in (200, 401, 403): s += 2
+    except Exception: pass
+    return s
+
+def run_screens():
+    """Best-effort screenshots of every live host via httpx -ss (system chromium)."""
+    if not A.screens: return
+    live = os.path.join(OUT, "live.txt")
+    if not (HTTPX and os.path.exists(live) and os.path.getsize(live)): return
+    chrome = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    sd = os.path.join(OUT, "screens"); os.makedirs(sd, exist_ok=True)
+    feed("📸 capturing screenshots of live hosts…")
+    cmd = [HTTPX, "-l", live, "-ss", "-srd", sd, "-json", "-silent", "-nc"] + \
+          (["-system-chrome"] if chrome else []) + HDR_ARGS
+    def on(l):
+        try: o = json.loads(l)
+        except Exception: return
+        sp = o.get("screenshot_path") or ""
+        host = _host_of(o.get("url") or o.get("input") or "")
+        if sp and host:
+            try: rel = os.path.relpath(sp, OUT)
+            except Exception: rel = sp
+            emit({"type": "host", "host": host, "shot": rel})
+    stream(cmd, on, key="screens")
+    feed("📸 screenshots complete", "good")
+
 def stage_vulns():
     emit({"type": "stage", "stage": "vulns", "state": "run"})
     feed("active testing discovered params (LFI/SSTI/redirect/reflection)…")
@@ -631,10 +677,11 @@ def stage_vulns():
             key = (_norm_path(url), k)
             if key in seen: skipped += 1; continue
             seen.add(key); tasks.append((url, k))
+    tasks.sort(key=lambda t: -_endpoint_score(t[0]))   # test the juiciest hosts first
     cap = 80 if A.fast else 250              # bound the request volume
     skipped += max(0, len(tasks) - cap)
     tasks = tasks[:cap]
-    feed(f"testing {len(tasks)} unique endpoint/param combos ({skipped} deduped/skipped)…")
+    feed(f"testing {len(tasks)} unique endpoint/param combos, highest-value first ({skipped} deduped/skipped)…")
     sem = threading.Semaphore(8)
     def test(url, param):
         with sem:
@@ -983,7 +1030,8 @@ def preflight_feed():
     wl_ok = os.path.exists(A.wordlist)
     feed(f"config: wordlist={os.path.basename(A.wordlist)}{'' if wl_ok else ' (MISSING!)'} · "
          f"out={OUT} · budget={A.max_requests or '∞'} · notify={'on' if A.notify else 'off'} · "
-         f"uploadpwn-auto={'ON' if A.uploadpwn_auto else 'off'} · diff={'on' if A.diff else 'off'}",
+         f"uploadpwn-auto={'ON' if A.uploadpwn_auto else 'off'} · diff={'on' if A.diff else 'off'} · "
+         f"screens={'on' if A.screens else 'off'}",
          "info" if wl_ok else "med")
 
 def _resume(name, path, count_key):
@@ -1014,6 +1062,7 @@ def _params_or_resume(live):
 
 def run_pipeline():
     try:
+        threading.Thread(target=_persist_state, daemon=True).start()   # crash-safe state.json
         preflight_feed()
         subs = _resume("enum", "subs.txt", "subs")
         if subs is None: subs = stage_enum()
@@ -1030,6 +1079,8 @@ def run_pipeline():
         else:
             for u in live: emit({"type": "host", "host": _host_of(u), "url": u, "map": "live"})
         if not STATE["running"]: return
+        if A.screens:                                # non-blocking screenshots of live hosts
+            threading.Thread(target=run_screens, daemon=True).start()
         # params + dirs in parallel (params is passive, dirs is heavy)
         tp = threading.Thread(target=_params_or_resume, args=(live,), daemon=True); tp.start()
         stage_dirs(live)
@@ -1353,7 +1404,7 @@ function renderRows(){
       `<td>${h.dirs?.length||0}</td><td>${h.params?.length||0}</td>`+
       `<td><b style="color:${(h.score||0)>=12?'var(--warn)':(h.score||0)>=6?'var(--amber)':'var(--faint)'}">${h.score||0}</b></td>`+
       `<td><span class="st ${stt}">${stlabel}</span>${stbar}</td>`+
-      `<td class="acts"><button class="btn" data-a="kill">kill</button><button class="btn" data-a="rescan">rescan</button><button class="btn" data-a="nuclei">nuclei</button><a class="btn" href="${esc(h.url||('https://'+h.host))}" target="_blank">open</a></td></tr>`;
+      `<td class="acts"><button class="btn" data-a="kill">kill</button><button class="btn" data-a="rescan">rescan</button><button class="btn" data-a="nuclei">nuclei</button>${h.shot?`<a class="btn" href="/shot?host=${encodeURIComponent(h.host)}" target="_blank" title="screenshot">📷</a>`:''}<a class="btn" href="${esc(h.url||('https://'+h.host))}" target="_blank">open</a></td></tr>`;
     if(expanded.has(h.host)){
       const dirs=(h.dirs||[]).map(d=>`<div class="dir"><span class="code ${cls(d.code)}">${d.code}</span> ${esc(d.path)} <span style="color:var(--faint)">${d.size??""}</span></div>`).join("")||'<span style="color:var(--faint)">no dirs yet</span>';
       const ps=(h.params||[]).map(p=>`<span class="tech">${esc(p)}</span>`).join("")||'<span style="color:var(--faint)">none</span>';
@@ -1458,6 +1509,15 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.urlparse(self.path).query
             typ = (urllib.parse.parse_qs(q).get("type", ["live"])[0])
             self._send(200, "text/plain; charset=utf-8", list_text(typ))
+        elif self.path.startswith("/shot"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            host = q.get("host", [""])[0]
+            sp = STATE["hosts"].get(host, {}).get("shot")
+            full = os.path.join(OUT, sp) if sp else ""
+            if full and os.path.exists(full):
+                self._send(200, "image/png", open(full, "rb").read())
+            else:
+                self._send(404, "text/plain", "no screenshot")
         elif self.path == "/report":
             try:
                 self._send(200, "text/markdown; charset=utf-8", open(os.path.join(OUT, "REPORT.md")).read())
