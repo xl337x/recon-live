@@ -16,16 +16,18 @@ A live recon and attack-surface mapping engine with an interactive browser dashb
 Pipeline (each stage streamed live to the browser):
 
 ```
-enum > resolve > probe > dirs > params > vulns > brain > intel
+enum > resolve > probe > dirs > params > vulns > brain > intel > report
 ```
 
 Features:
 
 * Full surface map. Every enumerated host is shown with a state badge: LIVE (HTTP up), DNS (resolves, no HTTP), or DEAD (enumerated, no DNS).
-* Discovery: subfinder and assetfinder, then dnsx, then ProjectDiscovery httpx (status, title, tech), then katana and gau for parameters, then feroxbuster for directories (bounded, quick wins first).
-* Vuln testing: confirmed-only LFI, SSTI, open-redirect and reflection checks, plus a signature-free differential probe that flags anomalous or injectable params by response diff.
+* Discovery: subfinder, assetfinder and crt.sh in parallel, then dnsx (with wildcard-DNS filtering), then ProjectDiscovery httpx (status, title, tech), then katana, gau and waybackurls for parameters (scope-guarded), then feroxbuster for directories (bounded, quick wins first, tech-aware extension sets).
+* Resume: every stage is recorded in `manifest.json`; re-running skips finished stages (per-host for dirs). `--fresh` redoes everything, `--fast` is a speed profile (45s ferox cap, smaller vuln queue).
+* Vuln testing: confirmed-only LFI, SSTI, open-redirect and reflection checks, plus a signature-free differential probe that flags anomalous or injectable params by response diff. Tracking params are skipped and numeric-path duplicates are deduped.
 * Intel stage (smart, not hardcoded): nuclei `-as` (automatic template selection per detected tech) and nuclei `-dast` (fuzzing templates on discovered params). Detection logic lives in maintained YAML.
 * Brain: tech-aware routing. File-upload forms go to uploadpwn, login forms are flagged, tech CVEs run via nuclei tags.
+* Findings and report: structured `findings.jsonl`, auto-generated `REPORT.md` and `report.json` (also served at `/report` on the dashboard), and a per-host `hosts/<host>/` layout (ferox.json, urls.txt, params.txt).
 * Auth: `--cookie` and `--header` flow to every tool and request. Adaptive User-Agent rotation and WAF or rate-limit backoff.
 * Dashboard: colour-coded status table, tech badges, attack-surface score, per-host kill, rescan and nuclei actions, live filters (surface, status, text), radar pulse and row flash on discovery, and a Lists panel to dump all subs, live, params, full URLs and dirs (copy and download) at any time.
 
@@ -38,7 +40,7 @@ python3 recon-live.py example.com     # or start immediately
 ```
 
 Useful flags: `--port`, `--cookie`, `--header 'Authorization: Bearer ...'`, `--time-limit 3m`,
-`--ferox-parallel 3`, `--wordlist <path>`, `--uploadpwn "python3 /path/uploadpwn.py -u {url}"`, `--no-test` (discovery only).
+`--fast` (speed profile), `--fresh` (ignore resume manifest), `--ferox-parallel 3`, `--wordlist <path>` (auto-falls back to dirb if SecLists is absent), `--out <dir>` (custom output dir), `--max-requests N` (global active-test budget), `--notify <webhook>` (POST on each high/crit finding), `--diff` (write `DIFF.md` vs the previous run), `--uploadpwn "python3 /path/uploadpwn.py -u {url}"` with `--uploadpwn-auto` (intrusive; off by default — upload points are only reported otherwise), `--no-test` (discovery only).
 
 ## Recon Console.html
 

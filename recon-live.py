@@ -8,7 +8,7 @@ Then open the URL it prints (http://127.0.0.1:8899).
 Pipeline: subfinder/assetfinder -> dnsx -> httpx(PD) -> feroxbuster (per host, watchdog)
           -> katana/gau parameter discovery.  Live progress + actions in the browser.
 """
-import sys, os, json, time, threading, subprocess, shutil, queue, argparse, html
+import sys, os, json, time, threading, subprocess, shutil, queue, argparse, html, socket
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -19,13 +19,30 @@ ap.add_argument("--port", type=int, default=8899)
 ap.add_argument("--wordlist", default="/usr/share/seclists/Discovery/Web-Content/common.txt")
 ap.add_argument("--ferox-parallel", type=int, default=3)
 ap.add_argument("--stall-secs", type=int, default=40, help="(legacy) unused; --time-limit bounds each host")
-ap.add_argument("--time-limit", default="3m", help="hard per-host ferox time cap (e.g. 90s, 3m)")
+ap.add_argument("--time-limit", default=None, help="hard per-host ferox time cap (e.g. 90s, 3m)")
 ap.add_argument("--no-test", dest="test", action="store_false", help="discovery only; skip active LFI/SSTI/redirect/XSS testing")
 ap.add_argument("--cookie", default="", help="Cookie header value, flows to every authed tool + request")
 ap.add_argument("--header", action="append", default=[], help="extra header 'Name: value' (repeatable)")
-ap.add_argument("--uploadpwn", default="", help="path/command for uploadpwn; run on detected upload forms")
+ap.add_argument("--uploadpwn", default="", help="path/command for uploadpwn (used only when auto-run is enabled)")
+ap.add_argument("--uploadpwn-auto", dest="uploadpwn_auto", action="store_true",
+                help="automatically run uploadpwn on detected upload forms (intrusive — OFF by default; otherwise upload points are only reported)")
+ap.add_argument("--fast", action="store_true", help="speed profile: 45s ferox cap, smaller vuln queue")
+ap.add_argument("--fresh", action="store_true", help="ignore manifest and rerun every stage")
+ap.add_argument("--out", default=None, help="output dir (default ~/recon/<domain>/<date>)")
+ap.add_argument("--max-requests", dest="max_requests", type=int, default=0,
+                help="global cap on active HTTP test requests (0 = unlimited)")
+ap.add_argument("--notify", default="", help="webhook URL POSTed a JSON payload on each high/crit finding")
+ap.add_argument("--diff", action="store_true", help="also write DIFF.md: new hosts/findings vs the previous run of this domain")
 ap.set_defaults(test=True)
 A = ap.parse_args()
+A.time_limit = A.time_limit or ("45s" if A.fast else "3m")
+# wordlist auto-fallback so it's correct out of the box even without SecLists installed
+if not os.path.exists(A.wordlist):
+    for _w in ("/usr/share/seclists/Discovery/Web-Content/common.txt",
+               "/usr/share/wordlists/dirb/common.txt",
+               "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt"):
+        if os.path.exists(_w):
+            A.wordlist = _w; break
 GOBIN = os.path.expanduser("~/go/bin")
 # make tools resolvable no matter which shell launched us (go / pipx / cargo bin dirs)
 for _d in (GOBIN, os.path.expanduser("~/.local/bin"), os.path.expanduser("~/.cargo/bin")):
@@ -47,11 +64,11 @@ OUT = ""
 AUTH_HEADERS = {}      # for urllib requests
 HDR_ARGS = []          # repeated -H args for httpx/katana/feroxbuster
 
-def set_scope(domain, cookie="", headers=None, uploadpwn=None, test=None):
+def set_scope(domain, cookie="", headers=None, uploadpwn=None, test=None, uploadpwn_auto=None):
     global DOMAIN, OUT, AUTH_HEADERS, HDR_ARGS
     DOMAIN = domain.strip().lower().lstrip("*.")
-    OUT = os.path.expanduser(f"~/recon/{DOMAIN}/{date.today()}")
-    os.makedirs(os.path.join(OUT, "ferox"), exist_ok=True)
+    OUT = os.path.expanduser(A.out) if A.out else os.path.expanduser(f"~/recon/{DOMAIN}/{date.today()}")
+    os.makedirs(os.path.join(OUT, "hosts"), exist_ok=True)
     os.makedirs(os.path.join(OUT, "params"), exist_ok=True)
     AUTH_HEADERS = {}; HDR_ARGS = []
     if cookie:
@@ -60,6 +77,7 @@ def set_scope(domain, cookie="", headers=None, uploadpwn=None, test=None):
         if ":" in _h:
             k, v = _h.split(":", 1); AUTH_HEADERS[k.strip()] = v.strip(); HDR_ARGS += ["-H", _h]
     if uploadpwn is not None: A.uploadpwn = uploadpwn
+    if uploadpwn_auto is not None: A.uploadpwn_auto = uploadpwn_auto
     if test is not None: A.test = test
 
 def _secs(s):
@@ -72,7 +90,7 @@ def _secs(s):
     except Exception:
         return 180
 
-STAGE_NAMES = ["enum", "resolve", "probe", "dirs", "params", "vulns", "brain", "intel"]
+STAGE_NAMES = ["enum", "resolve", "probe", "dirs", "params", "vulns", "brain", "intel", "report"]
 COUNT_KEYS = ["subs", "resolved", "live", "dirs", "params", "findings"]
 
 # ---------------- event bus ----------------
@@ -146,6 +164,40 @@ def bump(key, n=1):
     STATE["counts"][key] = STATE["counts"].get(key, 0) + n
     emit({"type": "count", "key": key, "value": STATE["counts"][key]})
 
+# ---------------- manifest (resume) + structured findings ----------------
+def manifest_load():
+    try: return json.load(open(os.path.join(OUT, "manifest.json")))
+    except Exception: return {}
+
+def manifest_save(m):
+    m["domain"] = DOMAIN; m["updated"] = time.time()
+    json.dump(m, open(os.path.join(OUT, "manifest.json"), "w"), indent=2)
+
+def mark_stage(name, **extra):
+    m = manifest_load(); m.setdefault("stages", {})[name] = {"done": True, "ts": time.time(), **extra}; manifest_save(m)
+
+def stage_done(name):
+    if A.fresh: return False
+    return bool(manifest_load().get("stages", {}).get(name, {}).get("done"))
+
+def mark_dir_host(host):
+    m = manifest_load(); st = m.setdefault("stages", {}).setdefault("dirs", {"done": False}); st.setdefault("hosts", {})[host] = True; manifest_save(m)
+
+def dir_host_done(host):
+    if A.fresh: return False
+    return bool(manifest_load().get("stages", {}).get("dirs", {}).get("hosts", {}).get(host))
+
+def finding(sev, kind, host, msg, url=""):
+    rec = {"ts": time.time(), "sev": sev, "kind": kind, "host": host, "msg": msg, "url": url}
+    try:
+        with open(os.path.join(OUT, "findings.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception: pass
+    emit({"type": "finding", "sev": sev, "host": host})
+    feed(msg, sev, host); bump("findings")
+    if sev in ("crit", "high"):
+        threading.Thread(target=_notify, args=(rec,), daemon=True).start()
+
 # ---------------- subprocess helpers ----------------
 PROCS = {}   # host -> Popen (for kill/rescan)
 
@@ -162,26 +214,60 @@ def stream(cmd, on_line, key=None):
     return p
 
 # ---------------- pipeline stages ----------------
+def _crtsh(domain):
+    out = []
+    try:
+        u = "https://crt.sh/?q=%25." + urllib.parse.quote(domain) + "&output=json"
+        req = urllib.request.Request(u, headers={"User-Agent": random.choice(UA_POOL)})
+        with urllib.request.urlopen(req, timeout=25, context=_CTX) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        for row in data:
+            for n in str(row.get("name_value", "")).splitlines():
+                out.append(n)
+    except Exception: pass
+    return out
+
 def stage_enum():
     emit({"type": "stage", "stage": "enum", "state": "run"})
     feed("enumerating subdomains…")
-    found = set()
+    found = set(); flock = threading.Lock()
     def add(l):
         l = l.strip().lower().strip(".")
+        if l.startswith("*."): l = l[2:]
         l = "".join(c for c in l if c.isprintable())
         while ".." in l: l = l.replace("..", ".")
-        if l and (l == DOMAIN or l.endswith("." + DOMAIN)) and l not in found:
-            found.add(l); bump("subs")
-    if shutil.which("subfinder"): stream(["subfinder", "-d", DOMAIN, "-all", "-silent"], add)
-    if shutil.which("assetfinder"): stream(["assetfinder", "--subs-only", DOMAIN], add)
+        if l and (l == DOMAIN or l.endswith("." + DOMAIN)):
+            with flock:
+                if l not in found:
+                    found.add(l); bump("subs")
+    def crt():
+        names = _crtsh(DOMAIN)
+        for n in names: add(n)
+        if names: feed(f"crt.sh: {len(names)} names", "info")
+    ths = [threading.Thread(target=crt, daemon=True)]
+    if shutil.which("subfinder"): ths.append(threading.Thread(target=stream, args=(["subfinder", "-d", DOMAIN, "-all", "-silent"], add), daemon=True))
+    if shutil.which("assetfinder"): ths.append(threading.Thread(target=stream, args=(["assetfinder", "--subs-only", DOMAIN], add), daemon=True))
+    for t in ths: t.start()
+    for t in ths: t.join()
     # fold www duplicates
     clean = sorted(h for h in found if not (h.startswith("www.") and h[4:] in found))
     open(os.path.join(OUT, "subs.txt"), "w").write("\n".join(clean) + "\n")
     for h in clean:                                   # map EVERY name (offline until proven otherwise)
         emit({"type": "host", "host": h, "map": "offline"})
+    mark_stage("enum", count=len(clean))
     emit({"type": "stage", "stage": "enum", "state": "done", "pct": 100})
     feed(f"found {len(clean)} in-scope names (full surface map)", "good")
     return clean
+
+def _wildcard_ips():
+    ips = set()
+    for _ in range(2):
+        junk = f"rl{random.randint(100000,999999)}.{DOMAIN}"
+        try:
+            for res in socket.getaddrinfo(junk, None):
+                ips.add(res[4][0])
+        except Exception: pass
+    return ips
 
 def stage_resolve(subs):
     emit({"type": "stage", "stage": "resolve", "state": "run"})
@@ -192,12 +278,29 @@ def stage_resolve(subs):
         if h:
             res.append(h); bump("resolved")
             emit({"type": "host", "host": h, "map": "resolved"})   # DNS ok (may still have no HTTP)
+    wild = _wildcard_ips()
     if shutil.which("dnsx"):
-        stream(["dnsx", "-l", os.path.join(OUT, "subs.txt"), "-silent", "-retry", "2"], _res)
+        if wild:
+            feed(f"⚠ wildcard DNS detected ({', '.join(sorted(wild))}) — filtering noise", "med")
+            cur = {}
+            def _resw(l):
+                parts = l.strip().split()            # dnsx -a -resp: host [ip] ([ip2] …)
+                if not parts: return
+                h = parts[0].lower()
+                ips = [x.strip("[]") for x in parts[1:] if x.startswith("[")]
+                cur.setdefault(h, set()).update(ips)
+            stream(["dnsx", "-l", os.path.join(OUT, "subs.txt"), "-a", "-resp", "-silent", "-retry", "2"], _resw)
+            for h, ips in sorted(cur.items()):
+                if ips and ips <= wild: continue     # every A record is the wildcard -> noise
+                res.append(h); bump("resolved")
+                emit({"type": "host", "host": h, "map": "resolved"})
+        else:
+            stream(["dnsx", "-l", os.path.join(OUT, "subs.txt"), "-silent", "-retry", "2"], _res)
     else:
         res = subs; feed("dnsx missing — skipping resolve", "med")
     res = sorted(set(res))
     open(os.path.join(OUT, "resolved.txt"), "w").write("\n".join(res) + "\n")
+    mark_stage("resolve", count=len(res))
     emit({"type": "stage", "stage": "resolve", "state": "done", "pct": 100})
     feed(f"{len(res)} names resolve", "good")
     return res
@@ -227,26 +330,51 @@ def stage_probe(resolved):
     stream([HTTPX, "-l", os.path.join(OUT, "resolved.txt"), "-json", "-silent",
             "-sc", "-title", "-td", "-fr", "-nc"] + HDR_ARGS, on)
     open(os.path.join(OUT, "live.txt"), "w").write("\n".join(sorted(set(live))) + "\n")
+    mark_stage("probe", count=len(live))
     emit({"type": "stage", "stage": "probe", "state": "done", "pct": 100})
     feed(f"{len(live)} live hosts", "good")
     return sorted(set(live))
 
 def _safe(url):
-    return "".join(c if c.isalnum() or c in ".-" else "_" for c in url.replace("https://", "").replace("http://", ""))
+    # strip scheme + ALL whitespace so a stray newline/blob can never build a monster filename,
+    # then map unsafe chars to _ and hard-cap the length (defensive against bad inputs).
+    s = url.replace("https://", "").replace("http://", "")
+    s = "".join(c if c.isalnum() or c in ".-" else "_" for c in s if not c.isspace())
+    return s[:120] or "host"
+
+def host_dir(host):
+    d = os.path.join(OUT, "hosts", _safe(host)); os.makedirs(d, exist_ok=True); return d
+
+TECH_EXT = [
+    (("php", "wordpress", "joomla", "drupal", "laravel", "magento"), "php,php.bak,txt,html"),
+    (("asp.net", "aspnet", "iis", "microsoft"), "asp,aspx,ashx,config,txt"),
+    (("java", "tomcat", "spring", "jenkins"), "jsp,do,action,xml,properties"),
+    (("node", "express", "next.js", "nuxt"), "js,json,txt"),
+    (("python", "django", "flask"), "json,txt,py"),
+]
+DEFAULT_EXT = "php,html,txt,json,bak"
+def _exts_for(host):
+    tech = " ".join(STATE["hosts"].get(host, {}).get("tech", [])).lower()
+    for keys, exts in TECH_EXT:
+        if any(k in tech for k in keys): return exts
+    return DEFAULT_EXT
 
 def ferox_host(url, done_ref):
     fero = shutil.which("feroxbuster")
     if not fero:
         feed("feroxbuster missing", "high"); return
+    url = (url.strip().splitlines() or [url])[0].strip()   # one clean URL only — never a joined blob
+    if not url:
+        return
     host = url.replace("https://", "").replace("http://", "").split("/")[0]
-    name = _safe(url)
-    outp = os.path.join(OUT, "ferox", name + ".json")
-    cmd = [fero, "-u", url, "-w", A.wordlist, "-x", "php,html,txt", "-t", "40",
+    exts = _exts_for(host)
+    outp = os.path.join(host_dir(host), "ferox.json")
+    cmd = [fero, "-u", url, "-w", A.wordlist, "-x", exts, "-t", "40",
            "-C", "404", "-k", "-n", "-T", "5", "--time-limit", A.time_limit, "--json", "--silent",
            "--rate-limit", "150", "-o", outp] + HDR_ARGS
     tl = _secs(A.time_limit)                      # hard per-host cap, in seconds
     emit({"type": "hoststate", "host": host, "state": "scanning", "pct": 0})
-    feed(f"ferox → {host}", "info", host)
+    feed(f"ferox → {host} (exts: {exts})", "info", host)
     t0 = time.time(); last = [time.time()]; hits = [0]
     try:
         p = subprocess.Popen(cmd, cwd=OUT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
@@ -279,13 +407,14 @@ def ferox_host(url, done_ref):
             except Exception: p.kill()
             emit({"type": "hoststate", "host": host, "state": "stalled", "pct": 100})
             feed(f"⚠ {host} hit time cap — moved on ({hits[0]} hits)", "med", host)
-            PROCS.pop(host, None); done_ref(); return
+            mark_dir_host(host); PROCS.pop(host, None); done_ref(); return
     rt.join(timeout=3)
     PROCS.pop(host, None)
     st = STATE["hosts"].get(host, {}).get("state")
     if st != "killed":
         emit({"type": "hoststate", "host": host, "state": "done", "elapsed": int(time.time() - t0)})
         feed(f"✓ {host} dir-brute done ({hits[0]} hits)", "good", host)
+    mark_dir_host(host)
     done_ref()
 
 def stage_dirs(live):
@@ -304,6 +433,14 @@ def stage_dirs(live):
         except Exception: c = 999
         return (0 if 200 <= c < 400 else 1, c)
     live = sorted(live, key=_rank)
+    skipped = [u for u in live if dir_host_done(u.replace("https://", "").replace("http://", "").split("/")[0])]
+    if skipped:
+        feed(f"↻ dirs: {len(skipped)} host(s) already brute-forced — skipping (--fresh to redo)", "info")
+    for u in skipped:
+        h = u.replace("https://", "").replace("http://", "").split("/")[0]
+        emit({"type": "hoststate", "host": h, "state": "done"})
+        done_ref()
+    live = [u for u in live if u not in skipped]
     sem = threading.Semaphore(A.ferox_parallel)
     threads = []
     def worker(u):
@@ -313,28 +450,41 @@ def stage_dirs(live):
     for u in live:
         t = threading.Thread(target=worker, args=(u,), daemon=True); t.start(); threads.append(t)
     for t in threads: t.join()
+    mark_stage("dirs")
     emit({"type": "stage", "stage": "dirs", "state": "done", "pct": 100})
     feed("directory brute complete", "good")
 
 def stage_params(live):
     emit({"type": "stage", "stage": "params", "state": "run"})
-    feed("discovering parameters (katana/gau)…")
-    urls = set(); params = set()
+    feed("discovering parameters (katana/gau/waybackurls)…")
+    urls = set(); params = set(); per_host = {}
     def add_url(l):
         l = l.strip()
-        if "?" in l and "=" in l:
-            urls.add(l)
-            import re
-            for m in re.findall(r"[?&]([a-zA-Z0-9_.-]+)=", l):
-                if m not in params:
-                    params.add(m); bump("params")
-                    emit({"type": "param", "host": DOMAIN, "name": m})
+        if "?" not in l or "=" not in l: return
+        try: netloc = urllib.parse.urlsplit(l).netloc.lower()
+        except Exception: return
+        if netloc != DOMAIN and not netloc.endswith("." + DOMAIN): return   # scope guard
+        urls.add(l)
+        d = per_host.setdefault(netloc, {"urls": set(), "params": set()})
+        d["urls"].add(l)
+        for m in _re.findall(r"[?&]([a-zA-Z0-9_.-]+)=", l):
+            d["params"].add(m)
+            if m not in params:
+                params.add(m); bump("params")
+                emit({"type": "param", "host": netloc, "name": m})
     if shutil.which("katana"):
         stream(["katana", "-list", os.path.join(OUT, "live.txt"), "-jc", "-d", "2", "-silent"] + HDR_ARGS, add_url)
     if shutil.which("gau"):
         stream(["gau", DOMAIN, "--subs"], add_url)
+    if shutil.which("waybackurls"):
+        stream(["waybackurls", DOMAIN], add_url)
     open(os.path.join(OUT, "params", "urls.txt"), "w").write("\n".join(sorted(urls)) + "\n")
     open(os.path.join(OUT, "params", "params.txt"), "w").write("\n".join(sorted(params)) + "\n")
+    for host, d in per_host.items():
+        hd = host_dir(host)
+        open(os.path.join(hd, "urls.txt"), "w").write("\n".join(sorted(d["urls"])) + "\n")
+        open(os.path.join(hd, "params.txt"), "w").write("\n".join(sorted(d["params"])) + "\n")
+    mark_stage("params", count=len(params))
     emit({"type": "stage", "stage": "params", "state": "done", "pct": 100})
     feed(f"{len(params)} unique parameters discovered", "good")
 
@@ -344,6 +494,28 @@ _CTX = ssl.create_default_context(); _CTX.check_hostname = False; _CTX.verify_mo
 class _NR(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k): return None
 _NOREDIR = urllib.request.build_opener(_NR(), urllib.request.HTTPSHandler(context=_CTX))
+
+# global request budget for active testing (bounds total volume when --max-requests is set)
+_REQN = [0]; _reqlock = threading.Lock(); _BUDGET_WARNED = [False]
+def _budget_ok():
+    if not A.max_requests: return True
+    with _reqlock:
+        if _REQN[0] >= A.max_requests:
+            if not _BUDGET_WARNED[0]:
+                _BUDGET_WARNED[0] = True
+                feed(f"⚠ request budget reached ({A.max_requests}) — pausing further active probes", "med")
+            return False
+        _REQN[0] += 1; return True
+
+def _notify(rec):
+    """POST a finding to the configured webhook (fire-and-forget)."""
+    if not A.notify: return
+    try:
+        text = f"[{rec.get('sev','').upper()}] {rec.get('kind','')} on {rec.get('host','')}: {rec.get('msg','')}"
+        payload = json.dumps({"text": text, "domain": DOMAIN, **rec}).encode()
+        req = urllib.request.Request(A.notify, data=payload, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8, context=_CTX)
+    except Exception: pass
 
 # adaptive brain: rotate UAs, detect WAF/rate-limit, back off automatically
 UA_POOL = [
@@ -378,7 +550,14 @@ LFI_RE = _re.compile(rb"root:[^:\n]*:0:0:")
 SSTI_TOKEN = "recon7x7"; SSTI_PAYLOAD = "recon{{7*7}}"; SSTI_HIT = b"recon49"
 XSS_PAYLOAD = "recon<b7>x"; XSS_HIT = b"recon<b7>x"
 
+TRACK_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content","gclid","fbclid","mc_cid","mc_eid","ref","_ga"}
+def _norm_path(url):
+    u = urllib.parse.urlsplit(url)
+    return (u.scheme, u.netloc, _re.sub(r"/\d+(?=/|$)", "/{n}", u.path))
+
 def _get(url, opener=None, timeout=8):
+    if not _budget_ok():
+        return None, {}, b""
     if WAF["delay"]:
         time.sleep(WAF["delay"] + random.uniform(0, 0.3))   # backoff + jitter when throttled
     hdrs = {"User-Agent": random.choice(UA_POOL)}; hdrs.update(AUTH_HEADERS)
@@ -418,13 +597,11 @@ def anomaly_probe(url, param, host):
         bl = body.lower()
         # newly-appearing error/stack signature = strong injectable signal
         if not base_has_err and any(e in bl for e in ERR_SIGS):
-            emit({"type": "finding", "sev": "med", "host": host}); bump("findings")
-            feed(f"⚑ anomalous error surfaced — {param} via {label} (possible injection) — {url[:70]}", "med", host)
+            finding("med", "anomaly", host, f"⚑ anomalous error surfaced — {param} via {label} (possible injection) — {url[:70]}")
             return
         # large response-size swing on a mutated value = worth manual review
         if base_l and abs(len(body) - base_l) > max(400, base_l * 0.5) and sc == b_sc:
-            emit({"type": "finding", "sev": "low", "host": host}); bump("findings")
-            feed(f"⚑ response diverges on {param} via {label} (Δ{len(body)-base_l}b) — review — {url[:60]}", "low", host)
+            finding("low", "anomaly", host, f"⚑ response diverges on {param} via {label} (Δ{len(body)-base_l}b) — review — {url[:60]}")
             return
 
 def _redirects_to(loc, host):
@@ -444,17 +621,20 @@ def stage_vulns():
         urls = [l.strip() for l in open(os.path.join(OUT, "params", "urls.txt")) if "?" in l and "=" in l]
     except Exception:
         urls = []
-    seen = set(); tasks = []
+    seen = set(); tasks = []; skipped = 0
     for url in urls:
         u = urllib.parse.urlsplit(url)
         for kv in u.query.split("&"):
             if "=" not in kv: continue
             k = kv.split("=", 1)[0]
-            key = (u.scheme, u.netloc, u.path, k)
-            if key in seen: continue
+            if k.lower() in TRACK_PARAMS: skipped += 1; continue
+            key = (_norm_path(url), k)
+            if key in seen: skipped += 1; continue
             seen.add(key); tasks.append((url, k))
-    tasks = tasks[:250]  # bound the request volume
-    feed(f"testing {len(tasks)} unique endpoint/param combos…")
+    cap = 80 if A.fast else 250              # bound the request volume
+    skipped += max(0, len(tasks) - cap)
+    tasks = tasks[:cap]
+    feed(f"testing {len(tasks)} unique endpoint/param combos ({skipped} deduped/skipped)…")
     sem = threading.Semaphore(8)
     def test(url, param):
         with sem:
@@ -465,20 +645,17 @@ def stage_vulns():
                 t = _inject(url, param, pl)
                 sc, hd, body = _get(t)
                 if body and (any(m in body for m in LFI_MARKERS) or LFI_RE.search(body)):
-                    emit({"type": "finding", "sev": "crit", "host": host})
-                    feed(f"‼ LFI/traversal — {param} → {t}", "crit", host); bump("findings"); break
+                    finding("crit", "lfi", host, f"‼ LFI/traversal — {param} → {t}", t); break
             # 2) SSTI
             t = _inject(url, param, urllib.parse.quote(SSTI_PAYLOAD))
             sc, hd, body = _get(t)
             if SSTI_HIT in (body or b""):
-                emit({"type": "finding", "sev": "crit", "host": host})
-                feed(f"‼ SSTI (7*7=49) — {param} → {t}", "crit", host); bump("findings")
+                finding("crit", "ssti", host, f"‼ SSTI (7*7=49) — {param} → {t}", t)
             # 3) reflected value (XSS candidate)
             t = _inject(url, param, urllib.parse.quote(XSS_PAYLOAD))
             sc, hd, body = _get(t)
             if XSS_HIT in (body or b""):
-                emit({"type": "finding", "sev": "high", "host": host})
-                feed(f"★ reflected unescaped — {param} (XSS candidate) → {t}", "high", host); bump("findings")
+                finding("high", "xss", host, f"★ reflected unescaped — {param} (XSS candidate) → {t}", t)
             # 4) open redirect — CONFIRMED only: real 3xx whose Location TARGET is our host
             #    (not a substring match — that flags http->https canonical redirects that
             #     merely echo the query string, i.e. false positives)
@@ -486,14 +663,14 @@ def stage_vulns():
             sc, hd, body = _get(t, opener=_NOREDIR)
             loc = (hd.get("Location") or hd.get("location") or "").strip()
             if sc in (301, 302, 303, 307, 308) and _redirects_to(loc, "recon.example"):
-                emit({"type": "finding", "sev": "high", "host": host})
-                feed(f"↪ open redirect CONFIRMED — {param} -> {loc[:80]}", "high", host); bump("findings")
+                finding("high", "open-redirect", host, f"↪ open redirect CONFIRMED — {param} -> {loc[:80]}")
             # 5) behavioral / differential — signature-free anomaly (no fixed payload per bug)
             anomaly_probe(url, param, host)
     th = []
     for (url, param) in tasks:
         x = threading.Thread(target=test, args=(url, param), daemon=True); x.start(); th.append(x)
     for x in th: x.join()
+    mark_stage("vulns", tasks=len(tasks))
     emit({"type": "stage", "stage": "vulns", "state": "done", "pct": 100})
     n = STATE["counts"].get("findings", 0)
     feed(f"active testing complete — {n} finding(s)", "good" if n == 0 else "crit")
@@ -584,8 +761,7 @@ def cors_host_checks(url, host):
             acao = r.headers.get("Access-Control-Allow-Origin", "").strip(); acac = r.headers.get("Access-Control-Allow-Credentials", "").strip()
             # real finding: ACAO exactly reflects our injected Origin, OR wildcard + credentials
             if acao.lower() == "https://recon.evil" or (acao == "*" and acac.lower() == "true"):
-                emit({"type": "finding", "sev": "high", "host": host}); bump("findings")
-                feed(f"↔ CORS misconfig on {host} (ACAO={acao}{' + creds' if acac.lower()=='true' else ''})", "high", host)
+                finding("high", "cors", host, f"↔ CORS misconfig on {host} (ACAO={acao}{' + creds' if acac.lower()=='true' else ''})")
     except Exception: pass
     try:
         # real finding: our injected Host actually controls an absolute redirect target
@@ -593,8 +769,7 @@ def cors_host_checks(url, host):
         r = _NOREDIR.open(req, timeout=8)
         loc = r.headers.get("Location", "").strip()
         if _redirects_to(loc, "recon.evil"):
-            emit({"type": "finding", "sev": "med", "host": host}); bump("findings")
-            feed(f"🧭 Host-header controls redirect on {host} -> {loc[:80]}", "med", host)
+            finding("med", "host-header", host, f"🧭 Host-header controls redirect on {host} -> {loc[:80]}")
     except Exception: pass
 
 def check_session(live):
@@ -623,8 +798,7 @@ def _nuclei_stream(cmd, tag):
         at = o.get("matched-at") or o.get("matched") or o.get("host", "")
         m = {"critical": "crit", "high": "high", "medium": "med"}.get(sev, "info")
         if sev in ("critical", "high", "medium", "low"):
-            emit({"type": "finding", "sev": m, "host": _host_of(at)}); bump("findings")
-            feed(f"nuclei[{sev}] {name} — {at}"[:150], m, _host_of(at))
+            finding(m, "nuclei", _host_of(at), f"nuclei[{sev}] {name} — {at}"[:150], at)
     stream(cmd, on, key=tag)
 
 def stage_intel():
@@ -644,6 +818,7 @@ def stage_intel():
         feed("nuclei -dast: fuzzing discovered parameters (SQLi/XSS/SSTI/LFI/redirect/CRLF via templates)…")
         _nuclei_stream([nuc, "-l", purls, "-dast", "-severity", "low,medium,high,critical",
                         "-jsonl", "-o", os.path.join(OUT, "nuclei_dast.jsonl"), "-silent", "-nc", "-rl", "60"] + HDR_ARGS, "nuclei-dast")
+    mark_stage("intel")
     emit({"type": "stage", "stage": "intel", "state": "done", "pct": 100})
     feed("nuclei intelligence complete", "good")
 
@@ -669,9 +844,12 @@ def stage_brain():
             if body:
                 if UPLOAD_RE.search(body):
                     upload = True
-                    emit({"type": "finding", "sev": "high", "host": host})
-                    feed(f"⇪ file-upload form on {host}", "high", host); bump("findings")
-                    run_uploadpwn(url, host)
+                    finding("high", "upload-form", host, f"⇪ file-upload form on {host}")
+                    if getattr(A, "uploadpwn_auto", False):
+                        run_uploadpwn(url, host)
+                    else:
+                        feed(f"⇪ upload point on {host} — not auto-exploited; use the host 'uploadpwn' "
+                             f"action or relaunch with --uploadpwn-auto (intrusive)", "med", host)
                 if LOGIN_RE.search(body):
                     login = True
                     feed(f"🔑 login form on {host} — auth / default-creds candidate", "med", host)
@@ -691,41 +869,182 @@ def stage_brain():
     for url in live:
         x = threading.Thread(target=analyze, args=(url,), daemon=True); x.start(); th.append(x)
     for x in th: x.join()
+    mark_stage("brain")
     emit({"type": "stage", "stage": "brain", "state": "done", "pct": 100})
     feed("smart routing complete", "good")
 
+# ---------------- auto report ----------------
+SEV_RANK = {"crit": 0, "high": 1, "med": 2, "low": 3, "info": 4}
+def write_report():
+    recs = []
+    try:
+        for l in open(os.path.join(OUT, "findings.jsonl")):
+            l = l.strip()
+            if l:
+                try: recs.append(json.loads(l))
+                except Exception: pass
+    except Exception: pass
+    recs.sort(key=lambda r: (SEV_RANK.get(r.get("sev", "info"), 9), r.get("host", "")))
+    hosts = sorted(STATE["hosts"].values(), key=lambda h: -(h.get("score") or 0))
+    rj = {"domain": DOMAIN, "generated": time.time(), "counts": dict(STATE["counts"]),
+          "stages": manifest_load().get("stages", {}), "findings": recs,
+          "hosts": [{"host": h.get("host", "?"), "url": h.get("url", ""), "status": h.get("status"),
+                     "codes": h.get("codes", ""), "title": h.get("title", ""), "tech": h.get("tech", []),
+                     "score": h.get("score", 0), "state": h.get("state", ""),
+                     "dirs": len(h.get("dirs", [])), "params": h.get("params", [])} for h in hosts]}
+    json.dump(rj, open(os.path.join(OUT, "report.json"), "w"), indent=2)
+    c = STATE["counts"]; el = int(time.time() - STATE["started"])
+    def esc(s): return str(s or "").replace("|", "\\|").replace("\n", " ")
+    def hrow(h):
+        return (f"| {esc(h.get('host', '?'))} | {esc(h.get('codes') or h.get('status') or '')} | {esc((h.get('title') or '')[:40])} "
+                f"| {esc(', '.join(h.get('tech', [])[:4]))} | {h.get('score', 0)} | {len(h.get('dirs', []))} | {len(h.get('params', []))} |")
+    L = [f"# recon-live report — {DOMAIN}",
+         f"\nGenerated {time.strftime('%Y-%m-%d %H:%M')} · elapsed {el // 60}m{el % 60}s · output: `{OUT}`\n",
+         "## Summary\n",
+         "| subs | resolved | live | dirs | params | findings |",
+         "|---|---|---|---|---|---|",
+         f"| {c.get('subs',0)} | {c.get('resolved',0)} | {c.get('live',0)} | {c.get('dirs',0)} | {c.get('params',0)} | {c.get('findings',0)} |\n",
+         "## Findings\n"]
+    if recs:
+        L += ["| sev | kind | host | msg | url |", "|---|---|---|---|---|"]
+        L += [f"| {r.get('sev','')} | {esc(r.get('kind',''))} | {esc(r.get('host',''))} | {esc(r.get('msg',''))} | {esc(r.get('url',''))} |" for r in recs]
+    else:
+        L.append("(none)")
+    live_hosts = [h for h in hosts if h.get("url")]
+    L += ["\n## Top attack surface\n",
+          "| host | code | title | tech | score | dirs | params |", "|---|---|---|---|---|---|---|"]
+    L += [hrow(h) for h in live_hosts[:15]]
+    L += ["\n## Live hosts\n",
+          "| host | code | title | tech | score | dirs | params |", "|---|---|---|---|---|---|---|"]
+    L += [hrow(h) for h in sorted(live_hosts, key=lambda h: h.get("host", ""))]
+    L += ["\n---",
+          "Output layout: `subs.txt`, `resolved.txt`, `live.txt`, `findings.jsonl`, "
+          "`hosts/<host>/` (ferox.json, urls.txt, params.txt), `params/`, `nuclei_*.jsonl`, `manifest.json`, `report.json`."]
+    open(os.path.join(OUT, "REPORT.md"), "w").write("\n".join(L) + "\n")
+
+def _prev_run_dir():
+    """Newest sibling run dir of this domain, excluding the current one."""
+    base = os.path.dirname(OUT.rstrip("/"))
+    cur = os.path.basename(OUT.rstrip("/"))
+    try:
+        sibs = sorted(d for d in os.listdir(base)
+                      if d != cur and os.path.isdir(os.path.join(base, d))
+                      and os.path.exists(os.path.join(base, d, "live.txt")))
+    except Exception:
+        return None
+    return os.path.join(base, sibs[-1]) if sibs else None
+
+def write_diff():
+    prev = _prev_run_dir()
+    if not prev:
+        feed("--diff: no previous run to compare against", "info"); return
+    def loadset(p):
+        try: return set(l.strip() for l in open(p) if l.strip())
+        except Exception: return set()
+    def loadfind(p):
+        out = []
+        try:
+            for l in open(p):
+                l = l.strip()
+                if l:
+                    try: out.append(json.loads(l))
+                    except Exception: pass
+        except Exception: pass
+        return out
+    new_live = loadset(os.path.join(OUT, "live.txt")) - loadset(os.path.join(prev, "live.txt"))
+    prev_keys = {(r.get("kind"), r.get("host"), r.get("msg")) for r in loadfind(os.path.join(prev, "findings.jsonl"))}
+    new_find = [r for r in loadfind(os.path.join(OUT, "findings.jsonl"))
+                if (r.get("kind"), r.get("host"), r.get("msg")) not in prev_keys]
+    L = [f"# recon-live DIFF — {DOMAIN}",
+         f"\nCurrent `{os.path.basename(OUT.rstrip('/'))}` vs previous `{os.path.basename(prev)}`\n",
+         f"## New live hosts ({len(new_live)})\n"] + ([f"- {u}" for u in sorted(new_live)] or ["(none)"])
+    L += [f"\n## New findings ({len(new_find)})\n"] + \
+         ([f"- **[{r.get('sev')}]** {r.get('kind')} — {r.get('host')} — {r.get('msg')}" for r in new_find] or ["(none)"])
+    open(os.path.join(OUT, "DIFF.md"), "w").write("\n".join(L) + "\n")
+    feed(f"📑 diff → DIFF.md ({len(new_live)} new hosts, {len(new_find)} new findings)", "good")
+
+def stage_report():
+    emit({"type": "stage", "stage": "report", "state": "run"})
+    write_report()
+    if A.diff:
+        try: write_diff()
+        except Exception as e: feed(f"diff error: {e}", "med")
+    emit({"type": "stage", "stage": "report", "state": "done", "pct": 100})
+    feed(f"📄 report written → {OUT}/REPORT.md", "good")
+
 def preflight_feed():
-    need = ["subfinder", "assetfinder", "dnsx", "feroxbuster", "katana", "gau", "nuclei"]
+    need = ["subfinder", "assetfinder", "dnsx", "feroxbuster", "katana", "gau", "waybackurls", "nuclei"]
     present = [b for b in need if shutil.which(b)]
     missing = [b for b in need if not shutil.which(b)]
     hx = "httpx(pd)" if HTTPX else "httpx(MISSING)"
     feed(f"tools ready: {', '.join(present)}, {hx}", "good")
     if missing or not HTTPX:
         feed(f"⚠ missing: {', '.join(missing + ([] if HTTPX else ['httpx']))} — run in WSL/Kali (python3), not Windows python", "med")
+    wl_ok = os.path.exists(A.wordlist)
+    feed(f"config: wordlist={os.path.basename(A.wordlist)}{'' if wl_ok else ' (MISSING!)'} · "
+         f"out={OUT} · budget={A.max_requests or '∞'} · notify={'on' if A.notify else 'off'} · "
+         f"uploadpwn-auto={'ON' if A.uploadpwn_auto else 'off'} · diff={'on' if A.diff else 'off'}",
+         "info" if wl_ok else "med")
+
+def _resume(name, path, count_key):
+    """Replay a finished stage from its artifact. Returns loaded lines, or None to rerun."""
+    p = os.path.join(OUT, path)
+    if stage_done(name) and os.path.exists(p):
+        lines = [l.strip() for l in open(p) if l.strip()]
+        emit({"type": "stage", "stage": name, "state": "done", "pct": 100})
+        if count_key: emit({"type": "count", "key": count_key, "value": len(lines)})
+        feed(f"↻ resumed {name} ({len(lines)} items) — --fresh to redo", "info")
+        return lines
+    return None
+
+def _skip_or_run(name, fn):
+    if stage_done(name):
+        emit({"type": "stage", "stage": name, "state": "done", "pct": 100})
+        feed(f"↻ resumed {name} — --fresh to redo", "info")
+    else:
+        fn()
+
+def _params_or_resume(live):
+    purls = _resume("params", os.path.join("params", "urls.txt"), None)
+    if purls is None:
+        stage_params(live); return
+    try: npar = len([l for l in open(os.path.join(OUT, "params", "params.txt")) if l.strip()])
+    except Exception: npar = 0
+    emit({"type": "count", "key": "params", "value": npar})
 
 def run_pipeline():
     try:
         preflight_feed()
-        subs = stage_enum()
+        subs = _resume("enum", "subs.txt", "subs")
+        if subs is None: subs = stage_enum()
+        else:
+            for h in subs: emit({"type": "host", "host": h, "map": "offline"})
         if not STATE["running"]: return
-        res = stage_resolve(subs)
+        res = _resume("resolve", "resolved.txt", "resolved")
+        if res is None: res = stage_resolve(subs)
+        else:
+            for h in res: emit({"type": "host", "host": h, "map": "resolved"})
         if not STATE["running"]: return
-        live = stage_probe(res)
+        live = _resume("probe", "live.txt", "live")
+        if live is None: live = stage_probe(res)
+        else:
+            for u in live: emit({"type": "host", "host": _host_of(u), "url": u, "map": "live"})
         if not STATE["running"]: return
         # params + dirs in parallel (params is passive, dirs is heavy)
-        tp = threading.Thread(target=stage_params, args=(live,), daemon=True); tp.start()
+        tp = threading.Thread(target=_params_or_resume, args=(live,), daemon=True); tp.start()
         stage_dirs(live)
         tp.join()
         if A.test and STATE["running"]:
-            stage_vulns()          # confirmed checks + signature-free differential anomaly probe
+            _skip_or_run("vulns", stage_vulns)       # confirmed checks + signature-free differential anomaly probe
             if STATE["running"]:
-                stage_brain()      # signal routing: forms, upload points, tech notes
+                _skip_or_run("brain", stage_brain)   # signal routing: forms, upload points, tech notes
             if STATE["running"]:
-                stage_intel()      # nuclei auto-templates (-as) + DAST fuzzing — detection logic in maintained YAML
+                _skip_or_run("intel", stage_intel)   # nuclei auto-templates (-as) + DAST fuzzing — detection logic in maintained YAML
         else:
             for s in ("vulns", "brain", "intel"):
-                emit({"type": "stage", "stage": s, "state": "done", "pct": 0})
-            feed("active testing skipped (--no-test)", "info")
+                if not stage_done(s): emit({"type": "stage", "stage": s, "state": "done", "pct": 0})
+            if not A.test: feed("active testing skipped (--no-test)", "info")
+        stage_report()                               # always regenerate
         feed("★ pipeline complete", "good")
     except Exception as e:
         feed(f"pipeline error: {e}", "high")
@@ -759,12 +1078,12 @@ def list_text(typ):
         return "\n".join(out) or "(none yet)"
     return "(unknown list type)"
 
-def start_run(domain, cookie="", headers=None, uploadpwn=None, test=None):
+def start_run(domain, cookie="", headers=None, uploadpwn=None, test=None, uploadpwn_auto=None):
     if STATE.get("phase") == "running":
         return False, "a scan is already running"
     if not domain.strip():
         return False, "no scope entered"
-    set_scope(domain, cookie, headers, uploadpwn, test)
+    set_scope(domain, cookie, headers, uploadpwn, test, uploadpwn_auto)
     reset_state()
     emit({"type": "phase", "phase": "running", "domain": DOMAIN})
     feed(f"◉ engagement started on {DOMAIN}", "good")
@@ -912,7 +1231,8 @@ tr.host.flash{animation:flashrow 1.1s ease}
     <textarea id="s_headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
     <label>uploadpwn command <span style="color:var(--faint)">— optional, {url} placeholder</span></label>
     <input type="text" id="s_upload" placeholder="auto: ~/tools/uploadpwn/uploadpwn.py">
-    <label class="chk"><input type="checkbox" id="s_test" checked> Active testing (LFI/SSTI/upload/nuclei) — authorized scope only</label>
+    <label class="chk"><input type="checkbox" id="s_test" checked> Active testing (LFI/SSTI/redirect/nuclei) — authorized scope only</label>
+    <label class="chk"><input type="checkbox" id="s_upload_auto"> Auto-run uploadpwn on upload forms <span style="color:var(--warn)">(intrusive — uploads payloads)</span></label>
     <button class="go" id="s_go">◉ Launch orchestration</button>
     <div id="s_msg" style="color:var(--warn);font-size:12px;margin-top:8px"></div>
   </div>
@@ -931,6 +1251,7 @@ tr.host.flash{animation:flashrow 1.1s ease}
     <div class="kpi find"><div class="n" id="c_findings">0</div><div class="l">findings</div></div>
   </div>
   <button class="btn" id="listsBtn">▤ Lists</button>
+  <a class="btn" href="/report" target="_blank">⬇ Report</a>
   <button class="btn stop" id="stopBtn">Stop</button>
 </header>
 <div id="lists"><div class="card">
@@ -974,7 +1295,7 @@ tr.host.flash{animation:flashrow 1.1s ease}
 <script>
 const $=s=>document.querySelector(s), rowsEl=$("#rows"), feedEl=$("#feed");
 let ST={hosts:{},counts:{},stages:{},feed:[],started:Date.now()/1000};
-const STAGES=["enum","resolve","probe","dirs","params","vulns","brain","intel"];
+const STAGES=["enum","resolve","probe","dirs","params","vulns","brain","intel","report"];
 const filters={q:"",set:new Set(["2xx","3xx","4xx","5xx"]),surf:new Set(["live","resolved","offline"]),dirs:false,sort:"score"};
 
 function cls(code){const c=parseInt(code);if(c>=200&&c<300)return"c2";if(c<400)return"c3";if(c<500)return"c4";if(c<600)return"c5";return"c0";}
@@ -1062,7 +1383,8 @@ function launch(){
   $("#s_go").textContent="◉ launching…";
   fetch("/start",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({domain:dom,cookie:$("#s_cookie").value.trim(),headers:$("#s_headers").value,
-      uploadpwn:$("#s_upload").value.trim(),test:$("#s_test").checked})})
+      uploadpwn:$("#s_upload").value.trim(),test:$("#s_test").checked,
+      uploadpwn_auto:$("#s_upload_auto").checked})})
    .then(r=>r.json()).then(d=>{ if(!d.ok){$("#s_msg").textContent=d.msg||"failed";$("#s_go").textContent="◉ Launch orchestration";}
      else{$("#tgt").textContent=d.msg;setPhase("running");} })
    .catch(e=>{$("#s_msg").textContent=""+e;$("#s_go").textContent="◉ Launch orchestration";});
@@ -1136,6 +1458,11 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.urlparse(self.path).query
             typ = (urllib.parse.parse_qs(q).get("type", ["live"])[0])
             self._send(200, "text/plain; charset=utf-8", list_text(typ))
+        elif self.path == "/report":
+            try:
+                self._send(200, "text/markdown; charset=utf-8", open(os.path.join(OUT, "REPORT.md")).read())
+            except Exception:
+                self._send(404, "text/plain", "report not generated yet — written at the end of the pipeline")
         elif self.path == "/events":
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "keep-alive"); self.end_headers()
@@ -1165,7 +1492,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/start":
             hdrs = [h for h in (data.get("headers") or "").splitlines() if h.strip()]
             ok, msg = start_run(data.get("domain", ""), data.get("cookie", ""), hdrs,
-                                data.get("uploadpwn") or None, bool(data.get("test", True)))
+                                data.get("uploadpwn") or None, bool(data.get("test", True)),
+                                bool(data.get("uploadpwn_auto", False)))
             self._send(200, "application/json", json.dumps({"ok": ok, "msg": msg}))
         else:
             self._send(404, "text/plain", "nope")
