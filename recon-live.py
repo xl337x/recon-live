@@ -35,6 +35,9 @@ ap.add_argument("--notify", default="", help="webhook URL POSTed a JSON payload 
 ap.add_argument("--diff", action="store_true", help="also write DIFF.md: new hosts/findings vs the previous run of this domain")
 ap.add_argument("--screens", action="store_true", help="capture a screenshot of every live host (httpx -ss, uses system chromium)")
 ap.add_argument("--depth", type=int, default=2, help="feroxbuster recursion depth (1 disables recursion; default 2 finds nested dirs like /dashboard/functions/)")
+ap.add_argument("--ports", action="store_true", help="port-scan resolved hosts (naabu) so httpx probes non-default ports too")
+ap.add_argument("--top-ports", dest="top_ports", type=int, default=100, help="naabu top-ports count (default 100)")
+ap.add_argument("--sqli", action="store_true", help="run sqlmap on the highest-value discovered params (heavy/noisy)")
 ap.add_argument("--setup", action="store_true", help="install/repair ALL dependencies (go tools + apt + nuclei templates), then exit unless a domain is given")
 ap.add_argument("--no-autosetup", dest="autosetup", action="store_false", help="do NOT auto-install missing go tools at startup")
 ap.set_defaults(test=True, autosetup=True)
@@ -74,8 +77,9 @@ GO_TOOLS = {
     "waybackurls": "github.com/tomnomnom/waybackurls@latest",
     "dalfox": "github.com/hahwul/dalfox/v2@latest",
     "subzy": "github.com/PentestPad/subzy@latest",
+    "naabu": "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
 }
-APT_TOOLS = {"feroxbuster": "feroxbuster", "chromium": "chromium", "seclists": "seclists"}
+APT_TOOLS = {"feroxbuster": "feroxbuster", "chromium": "chromium", "seclists": "seclists", "sqlmap": "sqlmap"}
 
 def _have(name):
     return bool(shutil.which(name) or os.path.exists(os.path.join(GOBIN, name)))
@@ -138,7 +142,7 @@ def _secs(s):
     except Exception:
         return 180
 
-STAGE_NAMES = ["enum", "resolve", "probe", "dirs", "params", "vulns", "brain", "intel", "report"]
+STAGE_NAMES = ["enum", "resolve", "ports", "probe", "dirs", "params", "vulns", "brain", "intel", "report"]
 COUNT_KEYS = ["subs", "resolved", "live", "dirs", "params", "findings"]
 
 # ---------------- event bus ----------------
@@ -362,12 +366,34 @@ def stage_resolve(subs):
     feed(f"{len(res)} names resolve", "good")
     return res
 
+def stage_ports(resolved):
+    """naabu port scan so httpx later probes non-default ports (8080/8443/…), not just 80/443."""
+    emit({"type": "stage", "stage": "ports", "state": "run"})
+    if not (A.ports and shutil.which("naabu")):
+        if A.ports: feed("naabu missing — skipping port scan (probe uses 80/443 only)", "med")
+        emit({"type": "stage", "stage": "ports", "state": "done", "pct": 0}); return resolved
+    feed(f"port-scanning {len(resolved)} hosts (naabu top-{A.top_ports})…")
+    out = []
+    def on(l):
+        l = l.strip()
+        if l: out.append(l)
+    stream(["naabu", "-l", os.path.join(OUT, "resolved.txt"), "-top-ports", str(A.top_ports),
+            "-s", "c", "-silent", "-retries", "1"], on)
+    out = sorted(set(out)) or resolved
+    open(os.path.join(OUT, "ports.txt"), "w").write("\n".join(out) + "\n")
+    mark_stage("ports", count=len(out))
+    emit({"type": "stage", "stage": "ports", "state": "done", "pct": 100})
+    feed(f"{len(out)} host:port endpoints to probe", "good")
+    return out
+
 def stage_probe(resolved):
     emit({"type": "stage", "stage": "probe", "state": "run"})
     feed("probing live hosts (httpx)…")
     if not HTTPX:
         feed("ProjectDiscovery httpx not found in ~/go/bin — install it", "high")
         emit({"type": "stage", "stage": "probe", "state": "done"}); return []
+    pin = os.path.join(OUT, "ports.txt")                          # probe scanned ports if we have them
+    pin = pin if (os.path.exists(pin) and os.path.getsize(pin)) else os.path.join(OUT, "resolved.txt")
     live = []
     def on(l):
         try:
@@ -384,7 +410,7 @@ def stage_probe(resolved):
         emit({"type": "host", "host": host, "url": url, "status": sc, "codes": codes, "title": title, "tech": tech, "map": "live"})
         if url:
             live.append(url); bump("live")
-    stream([HTTPX, "-l", os.path.join(OUT, "resolved.txt"), "-json", "-silent",
+    stream([HTTPX, "-l", pin, "-json", "-silent",
             "-sc", "-title", "-td", "-fr", "-nc"] + HDR_ARGS, on)
     open(os.path.join(OUT, "live.txt"), "w").write("\n".join(sorted(set(live))) + "\n")
     mark_stage("probe", count=len(live))
@@ -516,13 +542,15 @@ def stage_dirs(live):
 def stage_params(live):
     emit({"type": "stage", "stage": "params", "state": "run"})
     feed("discovering parameters (katana/gau/waybackurls)…")
-    urls = set(); params = set(); per_host = {}
+    urls = set(); params = set(); per_host = {}; js = set()
     def add_url(l):
         l = l.strip()
-        if "?" not in l or "=" not in l: return
         try: netloc = urllib.parse.urlsplit(l).netloc.lower()
         except Exception: return
-        if netloc != DOMAIN and not netloc.endswith("." + DOMAIN): return   # scope guard
+        if netloc and netloc != DOMAIN and not netloc.endswith("." + DOMAIN): return   # scope guard
+        if l.split("?", 1)[0].lower().endswith(".js"):
+            js.add(l); return
+        if "?" not in l or "=" not in l: return
         urls.add(l)
         d = per_host.setdefault(netloc, {"urls": set(), "params": set()})
         d["urls"].add(l)
@@ -539,6 +567,7 @@ def stage_params(live):
         stream(["waybackurls", DOMAIN], add_url)
     open(os.path.join(OUT, "params", "urls.txt"), "w").write("\n".join(sorted(urls)) + "\n")
     open(os.path.join(OUT, "params", "params.txt"), "w").write("\n".join(sorted(params)) + "\n")
+    open(os.path.join(OUT, "params", "js.txt"), "w").write("\n".join(sorted(js)) + "\n")
     for host, d in per_host.items():
         hd = host_dir(host)
         open(os.path.join(hd, "urls.txt"), "w").write("\n".join(sorted(d["urls"])) + "\n")
@@ -708,6 +737,56 @@ def exposure_checks(url, host):
                         f"‼ unauthenticated data at {child} ({len(cbody)}b, {csc}) — no cookie/auth needed", child)
             probed += 1
             if probed >= 25: break
+
+SENSITIVE_PATHS = [
+    ("/.git/HEAD", b"ref:"), ("/.git/config", b"[core]"), ("/.env", b"="),
+    ("/.svn/entries", b""), ("/.DS_Store", b"Bud1"), ("/config.php.bak", b"<?php"),
+    ("/wp-config.php.bak", b"DB_"), ("/backup.zip", b"PK"), ("/backup.tar.gz", b"\x1f\x8b"),
+    ("/db.sql", b""), ("/dump.sql", b""), ("/.htpasswd", b":"), ("/phpinfo.php", b"phpinfo()"),
+    ("/server-status", b"Apache Server Status"), ("/.aws/credentials", b"aws_"),
+    ("/composer.json", b'"require"'), ("/package.json", b'"dependencies"'), ("/.npmrc", b"_authToken"),
+]
+def check_exposed_files(url, host):
+    """Targeted probe for high-severity exposed files, independent of the ferox wordlist."""
+    base = url.rstrip("/")
+    if "://" not in base: base = "https://" + base
+    root = urllib.parse.urlunsplit(urllib.parse.urlsplit(base)[:2] + ("", "", ""))
+    for path, sig in SENSITIVE_PATHS:
+        sc, hd, body = _get(root + path, opener=_NOREDIR, timeout=7)
+        if sc == 200 and body and (not sig or sig in body[:64] or sig in body):
+            sev = "crit" if any(k in path for k in (".git", ".env", ".aws", "config", "backup", ".sql", "dump", "htpasswd", "npmrc")) else "high"
+            finding(sev, "exposed-file", host, f"🔓 exposed {path} ({len(body)}b) — {root+path}", root + path)
+
+SECRET_RE = [
+    (_re.compile(rb"AKIA[0-9A-Z]{16}"), "AWS access key"),
+    (_re.compile(rb"AIza[0-9A-Za-z_\-]{35}"), "Google API key"),
+    (_re.compile(rb"gh[pousr]_[0-9A-Za-z]{36,}"), "GitHub token"),
+    (_re.compile(rb"xox[baprs]-[0-9A-Za-z-]{10,}"), "Slack token"),
+    (_re.compile(rb"sk_live_[0-9a-zA-Z]{24,}"), "Stripe secret key"),
+    (_re.compile(rb"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"), "private key"),
+    (_re.compile(rb"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "JWT"),
+]
+JS_ENDPOINT_RE = _re.compile(rb'["\'`](/(?:api|v\d|rest|graphql|admin|internal)[/a-zA-Z0-9_\-.]{2,})["\'`]')
+def js_recon(host):
+    """Fetch this host's JS files, extract API endpoints and leaked secrets."""
+    try:
+        jsurls = [l.strip() for l in open(os.path.join(OUT, "params", "js.txt"))
+                  if l.strip() and urllib.parse.urlsplit(l).netloc == host]
+    except Exception:
+        jsurls = []
+    eps = set()
+    for u in jsurls[:20]:                                    # bound per host
+        sc, hd, body = _get(u, timeout=8)
+        if not body: continue
+        for rx, label in SECRET_RE:
+            if rx.search(body):
+                finding("crit", "secret", host, f"🔑 {label} leaked in JS — {u}", u)
+        for m in JS_ENDPOINT_RE.findall(body):
+            eps.add(m.decode("utf-8", "replace"))
+    if eps:
+        hd = host_dir(host)
+        open(os.path.join(hd, "js_endpoints.txt"), "w").write("\n".join(sorted(eps)) + "\n")
+        feed(f"🧩 {len(eps)} endpoints extracted from JS on {host}", "info", host)
 
 def _endpoint_score(url):
     """Cheap attack-surface score from data already gathered (params/dirs/status) —
@@ -962,6 +1041,25 @@ def stage_intel():
         feed("nuclei takeover templates: subdomain-takeover sweep…")
         _nuclei_stream([nuc, "-l", subs_all, "-tags", "takeover", "-jsonl",
                         "-o", os.path.join(OUT, "nuclei_takeover.jsonl"), "-silent", "-nc", "-rl", "80"] + HDR_ARGS, "nuclei-takeover")
+    # 3b) sqlmap on the highest-value parameterised URLs (opt-in; heavy/noisy)
+    if A.sqli and shutil.which("sqlmap") and os.path.exists(purls) and os.path.getsize(purls):
+        try:
+            cand = sorted({l.strip() for l in open(purls) if "?" in l and "=" in l},
+                          key=lambda u: -_endpoint_score(u))[:25]
+        except Exception:
+            cand = []
+        if cand:
+            mfile = os.path.join(OUT, "params", "sqli_targets.txt")
+            open(mfile, "w").write("\n".join(cand) + "\n")
+            feed(f"sqlmap: testing {len(cand)} highest-value URLs for SQL injection…")
+            sq = ["sqlmap", "-m", mfile, "--batch", "--smart", "--level", "1", "--risk", "1",
+                  "--random-agent", "--disable-coloring", "--output-dir", os.path.join(OUT, "sqlmap")]
+            if A.cookie: sq += ["--cookie", A.cookie]
+            def _sq(l):
+                low = l.lower()
+                if "is vulnerable" in low or "appears to be injectable" in low or "injectable" in low and "not" not in low:
+                    finding("crit", "sqli", DOMAIN, f"sqlmap: {l.strip()[:150]}")
+            stream(sq, _sq, key="sqlmap")
     # 4) dalfox XSS confirmation on discovered params (optional — only if installed)
     if shutil.which("dalfox") and os.path.exists(purls) and os.path.getsize(purls):
         feed("dalfox: confirming reflected/DOM XSS on discovered params…")
@@ -1011,6 +1109,8 @@ def stage_brain():
             # cheap, no-dep scenario tests
             cors_host_checks(url, host)
             exposure_checks(url, host)               # broken access control / autoindex on the root
+            check_exposed_files(url, host)           # .git/.env/backups/secrets independent of wordlist
+            js_recon(host)                           # API endpoints + leaked secrets from JS
             hd0 = STATE["hosts"].get(host, {})       # + on discovered directories / interesting paths
             checked = 0
             for d in hd0.get("dirs", []):
@@ -1186,8 +1286,15 @@ def run_pipeline():
         else:
             for h in res: emit({"type": "host", "host": h, "map": "resolved"})
         if not STATE["running"]: return
+        targets = res
+        if A.ports:
+            pr = _resume("ports", "ports.txt", None)
+            targets = pr if pr is not None else stage_ports(res)
+        else:
+            emit({"type": "stage", "stage": "ports", "state": "done", "pct": 0})
+        if not STATE["running"]: return
         live = _resume("probe", "live.txt", "live")
-        if live is None: live = stage_probe(res)
+        if live is None: live = stage_probe(targets)
         else:
             for u in live: emit({"type": "host", "host": _host_of(u), "url": u, "map": "live"})
         if not STATE["running"]: return
@@ -1458,7 +1565,7 @@ tr.host.flash{animation:flashrow 1.1s ease}
 <script>
 const $=s=>document.querySelector(s), rowsEl=$("#rows"), feedEl=$("#feed");
 let ST={hosts:{},counts:{},stages:{},feed:[],started:Date.now()/1000};
-const STAGES=["enum","resolve","probe","dirs","params","vulns","brain","intel","report"];
+const STAGES=["enum","resolve","ports","probe","dirs","params","vulns","brain","intel","report"];
 const filters={q:"",set:new Set(["2xx","3xx","4xx","5xx"]),surf:new Set(["live","resolved","offline"]),dirs:false,sort:"score"};
 
 function cls(code){const c=parseInt(code);if(c>=200&&c<300)return"c2";if(c<400)return"c3";if(c<500)return"c4";if(c<600)return"c5";return"c0";}
