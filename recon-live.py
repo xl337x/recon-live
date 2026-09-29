@@ -175,6 +175,21 @@ def reset_state():
     STATE["counts"] = {k: 0 for k in COUNT_KEYS}
     STATE["hosts"] = {}; STATE["feed"] = []; STATE["running"] = True
 
+def restore_state():
+    """On resume, reload the last state.json so hosts/status/dirs/findings/stages
+    show immediately instead of resetting to zero (resume-view fidelity)."""
+    if A.fresh: return
+    try:
+        old = json.load(open(os.path.join(OUT, "state.json")))
+    except Exception:
+        return
+    if not (old.get("hosts") or old.get("counts")): return
+    STATE["hosts"] = old.get("hosts") or {}
+    for k, v in (old.get("counts") or {}).items():
+        if k in STATE["counts"]: STATE["counts"][k] = v
+    if old.get("stages"): STATE["stages"].update(old["stages"])
+    STATE["feed"] = (old.get("feed") or [])[-200:]
+
 def _persist_state():
     """Periodically dump STATE to disk so a crash doesn't lose the dashboard view."""
     while STATE.get("running"):
@@ -261,13 +276,26 @@ def dir_host_done(host):
     return bool(manifest_load().get("stages", {}).get("dirs", {}).get("hosts", {}).get(host))
 
 _FIND_SEEN = set(); _find_lock = threading.Lock()
+# triage — the tool decides what is report-grade (oracle/evidence-confirmed) vs a lead to review
+_CONFIRMED_KINDS = {"sqli", "lfi", "ssti", "xss", "access-control", "unauth-data", "exposed-file",
+                    "secret", "open-redirect", "cors", "dir-listing", "takeover", "rce", "host-header"}
+def _triage(kind, sev):
+    if kind == "anomaly" or sev in ("low", "info"):
+        return "investigate"
+    if kind == "nuclei":
+        return "confirmed" if sev in ("crit", "high") else "investigate"
+    if kind in _CONFIRMED_KINDS:
+        return "confirmed"
+    return "investigate"
+
 def finding(sev, kind, host, msg, url=""):
     # dedup identical findings (the same vuln can be reached via both crawl + brute paths)
     dk = (kind, host, url, msg)
     with _find_lock:
         if dk in _FIND_SEEN: return
         _FIND_SEEN.add(dk)
-    rec = {"ts": time.time(), "sev": sev, "kind": kind, "host": host, "msg": msg, "url": url}
+    rec = {"ts": time.time(), "sev": sev, "kind": kind, "host": host, "msg": msg, "url": url,
+           "status": _triage(kind, sev)}
     try:
         with open(os.path.join(OUT, "findings.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -438,8 +466,8 @@ def stage_probe(resolved):
         emit({"type": "host", "host": host, "url": url, "status": sc, "codes": codes, "title": title, "tech": tech, "map": "live"})
         if url:
             live.append(url); bump("live")
-    stream([HTTPX, "-l", pin, "-json", "-silent",
-            "-sc", "-title", "-td", "-fr", "-nc"] + HDR_ARGS, on)
+    stream([HTTPX, "-l", pin, "-json", "-silent", "-timeout", "8",
+            "-sc", "-title", "-td", "-nc"] + HDR_ARGS, on)
     # Robustness fallback: if httpx yielded nothing (parsing quirk, scheme guess, transient
     # failure) but the targets are actually up, probe each host directly on http+https so a
     # live host is NEVER silently dropped and the whole detection pipeline can't run on air.
@@ -1376,10 +1404,21 @@ def write_report():
          "| subs | resolved | live | dirs | params | findings |",
          "|---|---|---|---|---|---|",
          f"| {c.get('subs',0)} | {c.get('resolved',0)} | {c.get('live',0)} | {c.get('dirs',0)} | {c.get('params',0)} | {c.get('findings',0)} |\n",
-         "## Findings\n"]
-    if recs:
+    ]
+    def _rowf(r):
+        return f"| {r.get('sev','')} | {esc(r.get('kind',''))} | {esc(r.get('host',''))} | {esc(r.get('msg',''))} | {esc(r.get('url',''))} |"
+    confirmed = [r for r in recs if r.get("status", _triage(r.get("kind",""), r.get("sev",""))) == "confirmed"]
+    leads = [r for r in recs if r.get("status", _triage(r.get("kind",""), r.get("sev",""))) != "confirmed"]
+    L += [f"## Confirmed findings — report these ({len(confirmed)})\n"]
+    if confirmed:
         L += ["| sev | kind | host | msg | url |", "|---|---|---|---|---|"]
-        L += [f"| {r.get('sev','')} | {esc(r.get('kind',''))} | {esc(r.get('host',''))} | {esc(r.get('msg',''))} | {esc(r.get('url',''))} |" for r in recs]
+        L += [_rowf(r) for r in confirmed]
+    else:
+        L.append("(none)")
+    L += [f"\n## Needs investigation — leads to review manually ({len(leads)})\n"]
+    if leads:
+        L += ["| sev | kind | host | msg | url |", "|---|---|---|---|---|"]
+        L += [_rowf(r) for r in leads]
     else:
         L.append("(none)")
     live_hosts = [h for h in hosts if h.get("url")]
@@ -1487,6 +1526,8 @@ def _params_or_resume(live):
 
 def run_pipeline():
     try:
+        restore_state()                                                # resume: repopulate the view first
+        emit({"type": "snapshot", "state": STATE})                     # push restored view to any client
         threading.Thread(target=_persist_state, daemon=True).start()   # crash-safe state.json
         preflight_feed()
         subs = _resume("enum", "subs.txt", "subs")
@@ -1525,7 +1566,7 @@ def run_pipeline():
                 _skip_or_run("intel", stage_intel)   # nuclei auto-templates (-as) + DAST fuzzing — detection logic in maintained YAML
         else:
             for s in ("vulns", "brain", "intel"):
-                if not stage_done(s): emit({"type": "stage", "stage": s, "state": "done", "pct": 0})
+                emit({"type": "stage", "stage": s, "state": "done", "pct": 100 if stage_done(s) else 0})
             if not A.test: feed("active testing skipped (--no-test)", "info")
         stage_report()                               # always regenerate
         feed("★ pipeline complete", "good")
@@ -1734,7 +1775,7 @@ tr.host.flash{animation:flashrow 1.1s ease}
     <div class="kpi find"><div class="n" id="c_findings">0</div><div class="l">findings</div></div>
   </div>
   <button class="btn" id="listsBtn">▤ Lists</button>
-  <a class="btn" href="/report" target="_blank">⬇ Report</a>
+  <a class="btn" href="/report?raw=1" target="_blank">⬇ Report</a>
   <button class="btn stop" id="stopBtn">Stop</button>
 </header>
 <div id="lists"><div class="card">
@@ -1950,9 +1991,10 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, "image/png", open(full, "rb").read())
             else:
                 self._send(404, "text/plain", "no screenshot")
-        elif self.path == "/report":
+        elif self.path.startswith("/report"):
+            # serve as text/plain so browsers display it inline instead of downloading
             try:
-                self._send(200, "text/markdown; charset=utf-8", open(os.path.join(OUT, "REPORT.md")).read())
+                self._send(200, "text/plain; charset=utf-8", open(os.path.join(OUT, "REPORT.md")).read())
             except Exception:
                 self._send(404, "text/plain", "report not generated yet — written at the end of the pipeline")
         elif self.path == "/events":
