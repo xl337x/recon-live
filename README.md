@@ -54,7 +54,10 @@ then Copy or Download the generated `.sh`. Runs the same pipeline offline as a s
 * Recon toolchain on PATH: `subfinder`, `assetfinder`, `dnsx`, `httpx` (ProjectDiscovery), `feroxbuster`,
   `katana`, `gau`, `nuclei`. Optional: `uploadpwn`, `waybackurls`, `qsreplace`, `dalfox`, `sqlmap`, `x8`.
 
-Run `./setup.sh` on Kali or WSL to install the missing ones and fix PATH.
+Self-bootstrapping: on first run the tool auto-installs any missing **go** tools (httpx, subfinder,
+dnsx, katana, nuclei, gau, assetfinder, waybackurls, dalfox, subzy) — disable with `--no-autosetup`.
+For a full install including the sudo/apt tools (feroxbuster, chromium, seclists) and nuclei templates,
+run `python3 recon-live.py --setup` or `./setup.sh`.
 
 > Note: ProjectDiscovery `httpx` must be resolvable (the Python `httpx` CLI shadows it). recon-live prefers `~/go/bin/httpx` automatically.
 

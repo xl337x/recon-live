@@ -35,7 +35,9 @@ ap.add_argument("--notify", default="", help="webhook URL POSTed a JSON payload 
 ap.add_argument("--diff", action="store_true", help="also write DIFF.md: new hosts/findings vs the previous run of this domain")
 ap.add_argument("--screens", action="store_true", help="capture a screenshot of every live host (httpx -ss, uses system chromium)")
 ap.add_argument("--depth", type=int, default=2, help="feroxbuster recursion depth (1 disables recursion; default 2 finds nested dirs like /dashboard/functions/)")
-ap.set_defaults(test=True)
+ap.add_argument("--setup", action="store_true", help="install/repair ALL dependencies (go tools + apt + nuclei templates), then exit unless a domain is given")
+ap.add_argument("--no-autosetup", dest="autosetup", action="store_false", help="do NOT auto-install missing go tools at startup")
+ap.set_defaults(test=True, autosetup=True)
 A = ap.parse_args()
 A.time_limit = A.time_limit or ("45s" if A.fast else "3m")
 # wordlist auto-fallback so it's correct out of the box even without SecLists installed
@@ -59,6 +61,50 @@ def tool(name, prefer_go=False):
     return shutil.which(name) or (g if os.path.exists(g) else None)
 
 HTTPX = tool("httpx", prefer_go=True)  # ProjectDiscovery httpx, not python httpx
+
+# ---------------- self-bootstrap: install anything missing so the tool works out of the box ----------------
+GO_TOOLS = {
+    "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
+    "subfinder": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+    "dnsx": "github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
+    "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
+    "nuclei": "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+    "gau": "github.com/lc/gau/v2/cmd/gau@latest",
+    "assetfinder": "github.com/tomnomnom/assetfinder@latest",
+    "waybackurls": "github.com/tomnomnom/waybackurls@latest",
+    "dalfox": "github.com/hahwul/dalfox/v2@latest",
+    "subzy": "github.com/PentestPad/subzy@latest",
+}
+APT_TOOLS = {"feroxbuster": "feroxbuster", "chromium": "chromium", "seclists": "seclists"}
+
+def _have(name):
+    return bool(shutil.which(name) or os.path.exists(os.path.join(GOBIN, name)))
+
+def bootstrap(install=True, verbose=True, do_apt=False):
+    """Install missing dependencies (go tools always; apt tools when do_apt). Re-resolves HTTPX."""
+    global HTTPX
+    if install and not shutil.which("go"):
+        if verbose: print("[!] go not found — install golang first: sudo apt-get install -y golang-go")
+    elif install:
+        env = dict(os.environ, GOSUMDB="off", GOFLAGS="-mod=mod")
+        for name, path in GO_TOOLS.items():
+            if _have(name):
+                continue
+            if verbose: print(f"[+] installing {name} …", flush=True)
+            r = subprocess.run(["go", "install", path], env=env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if verbose:
+                print("    ok" if r.returncode == 0 else f"    FAILED: {(r.stderr or '').strip().splitlines()[-1:]}")
+    if install and do_apt and shutil.which("apt-get"):
+        for name, pkg in APT_TOOLS.items():
+            if _have(name): continue
+            if verbose: print(f"[+] apt-get install {pkg} (needs sudo)…", flush=True)
+            subprocess.run(["sudo", "apt-get", "install", "-y", pkg])
+    if install and _have("nuclei"):
+        subprocess.run([shutil.which("nuclei") or os.path.join(GOBIN, "nuclei"), "-update-templates"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    HTTPX = tool("httpx", prefer_go=True)                       # re-resolve after any install
+    return [n for n in list(GO_TOOLS) + list(APT_TOOLS) if not _have(n)]
 
 # ---------------- scope (set at launch OR from the page via POST /start) ----------------
 DOMAIN = ""
@@ -1625,6 +1671,20 @@ class H(BaseHTTPRequestHandler):
             self._send(404, "text/plain", "nope")
 
 def main():
+    if A.setup:
+        print("[*] recon-live setup — installing/repairing all dependencies…")
+        left = bootstrap(install=True, verbose=True, do_apt=True)
+        print(f"[+] setup complete. still missing (install manually): {', '.join(left) or 'none'}")
+        if not A.domain:
+            return
+    elif A.autosetup and shutil.which("go"):
+        miss = [n for n in GO_TOOLS if not _have(n)]
+        if miss:
+            print(f"[*] auto-setup: installing {len(miss)} missing go tool(s): {', '.join(miss)}  (disable with --no-autosetup)")
+            bootstrap(install=True, verbose=True, do_apt=False)
+        apt_miss = [n for n in APT_TOOLS if not _have(n)]
+        if apt_miss:
+            print(f"[!] not auto-installed (need sudo — run ./setup.sh or --setup): {', '.join(apt_miss)}")
     if not HTTPX:
         print("WARNING: ProjectDiscovery httpx not found in ~/go/bin (python httpx will not work).")
     srv = ThreadingHTTPServer(("127.0.0.1", A.port), H)
