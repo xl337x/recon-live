@@ -16,7 +16,7 @@ A live recon and attack-surface mapping engine with an interactive browser dashb
 Pipeline (each stage streamed live to the browser):
 
 ```
-enum > resolve > probe > dirs > params > vulns > brain > intel > report
+enum > resolve > ports > probe > dirs > params > vulns > brain > intel > report
 ```
 
 Features:
@@ -24,7 +24,9 @@ Features:
 * Full surface map. Every enumerated host is shown with a state badge: LIVE (HTTP up), DNS (resolves, no HTTP), or DEAD (enumerated, no DNS).
 * Discovery: subfinder, assetfinder and crt.sh in parallel, then dnsx (with wildcard-DNS filtering), then ProjectDiscovery httpx (status, title, tech), then katana, gau and waybackurls for parameters (scope-guarded), then feroxbuster for directories (bounded, quick wins first, tech-aware extension sets).
 * Resume: every stage is recorded in `manifest.json`; re-running skips finished stages (per-host for dirs). `--fresh` redoes everything, `--fast` is a speed profile (45s ferox cap, smaller vuln queue).
-* Vuln testing: confirmed-only LFI, SSTI, open-redirect and reflection checks, plus a signature-free differential probe that flags anomalous or injectable params by response diff. Tracking params are skipped and numeric-path duplicates are deduped.
+* Vuln testing: confirmed-only LFI, SSTI, open-redirect, reflected-XSS and SQL injection (error-based + time-based blind, multi-DB), plus a signature-free differential probe. Tests GET params AND submits/tests HTML forms over POST (login username/password, project params) for SQLi and XSS — regardless of parameter name. Tracking params skipped, numeric-path duplicates deduped, time-based probes budget-capped.
+* Access control & exposure: flags 3xx responses that still return a data body (silent-redirect / auth-bypass leak), autoindex directory listings and the unauthenticated endpoints they reveal, exposed files (.git/.env/backups/.sql/creds), and secrets/API endpoints extracted from JS.
+* Port scan (`--ports`, naabu) so non-default ports are probed; subdomain-takeover sweep (subzy/nuclei); optional dalfox and sqlmap.
 * Intel stage (smart, not hardcoded): nuclei `-as` (automatic template selection per detected tech) and nuclei `-dast` (fuzzing templates on discovered params). Detection logic lives in maintained YAML.
 * Brain: tech-aware routing. File-upload forms go to uploadpwn, login forms are flagged, tech CVEs run via nuclei tags.
 * Findings and report: structured `findings.jsonl`, auto-generated `REPORT.md` and `report.json` (also served at `/report` on the dashboard), and a per-host `hosts/<host>/` layout (ferox.json, urls.txt, params.txt).
