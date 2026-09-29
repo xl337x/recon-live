@@ -142,6 +142,18 @@ def _secs(s):
     except Exception:
         return 180
 
+def _is_ip(s):
+    """True if s (a bare host, no scheme/port) is an IPv4/IPv6 literal."""
+    h = str(s).split(":", 1)[0] if str(s).count(":") == 1 else str(s)
+    try:
+        socket.inet_aton(h); return True
+    except Exception:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, str(s)); return True
+    except Exception:
+        return False
+
 STAGE_NAMES = ["enum", "resolve", "ports", "probe", "dirs", "params", "vulns", "brain", "intel", "report"]
 COUNT_KEYS = ["subs", "resolved", "live", "dirs", "params", "findings"]
 
@@ -547,7 +559,8 @@ def stage_params(live):
         l = l.strip()
         try: netloc = urllib.parse.urlsplit(l).netloc.lower()
         except Exception: return
-        if netloc and netloc != DOMAIN and not netloc.endswith("." + DOMAIN): return   # scope guard
+        hostonly = netloc.split(":", 1)[0]   # ignore port so IP:port / host:port targets stay in scope
+        if netloc and hostonly != DOMAIN and not hostonly.endswith("." + DOMAIN): return   # scope guard
         if l.split("?", 1)[0].lower().endswith(".js"):
             js.add(l); return
         if "?" not in l or "=" not in l: return
@@ -561,10 +574,13 @@ def stage_params(live):
                 emit({"type": "param", "host": netloc, "name": m})
     if shutil.which("katana"):
         stream(["katana", "-list", os.path.join(OUT, "live.txt"), "-jc", "-d", "2", "-silent"] + HDR_ARGS, add_url)
-    if shutil.which("gau"):
-        stream(["gau", DOMAIN, "--subs"], add_url)
-    if shutil.which("waybackurls"):
-        stream(["waybackurls", DOMAIN], add_url)
+    # OSINT URL sources (gau/waybackurls) only make sense for real domains — for a bare
+    # IP they return unrelated dataset noise that crowds out real params, so skip them.
+    if not _is_ip(DOMAIN):
+        if shutil.which("gau"):
+            stream(["gau", DOMAIN, "--subs"], add_url)
+        if shutil.which("waybackurls"):
+            stream(["waybackurls", DOMAIN], add_url)
     open(os.path.join(OUT, "params", "urls.txt"), "w").write("\n".join(sorted(urls)) + "\n")
     open(os.path.join(OUT, "params", "params.txt"), "w").write("\n".join(sorted(params)) + "\n")
     open(os.path.join(OUT, "params", "js.txt"), "w").write("\n".join(sorted(js)) + "\n")
@@ -828,7 +844,9 @@ def exposure_checks(url, host):
     # (2) directory listing / autoindex → flag, then harvest and probe the listed files unauthenticated
     if body and AUTOINDEX_RE.search(body):
         finding("high", "dir-listing", host, f"📂 directory listing (autoindex) exposed — {url}", url)
-        base = url if url.endswith("/") else url.rsplit("/", 1)[0] + "/"
+        # an autoindex URL *is* a directory — treat it as one so relative child links resolve
+        # correctly even when ferox reported the path without a trailing slash
+        base = url if url.endswith("/") else url + "/"
         probed = 0
         for m in HREF_RE.findall(body):
             name = m.decode("utf-8", "replace").strip()
