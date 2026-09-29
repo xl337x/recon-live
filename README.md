@@ -40,7 +40,7 @@ python3 recon-live.py example.com     # or start immediately
 ```
 
 Useful flags: `--port`, `--cookie`, `--header 'Authorization: Bearer ...'`, `--time-limit 3m`,
-`--fast` (speed profile), `--fresh` (ignore resume manifest), `--ferox-parallel 3`, `--wordlist <path>` (auto-falls back to dirb if SecLists is absent), `--out <dir>` (custom output dir), `--max-requests N` (global active-test budget), `--notify <webhook>` (POST on each high/crit finding), `--diff` (write `DIFF.md` vs the previous run), `--screens` (screenshot every live host, camera link in the dashboard), `--uploadpwn "python3 /path/uploadpwn.py -u {url}"` with `--uploadpwn-auto` (intrusive; off by default — upload points are only reported otherwise), `--no-test` (discovery only).
+`--fast` (speed profile), `--fresh` (ignore resume manifest), `--ferox-parallel 3`, `--wordlist <path>` (auto-falls back to dirb if SecLists is absent), `--out <dir>` (custom output dir), `--max-requests N` (global active-test budget), `--notify <webhook>` (POST on each high/crit finding), `--diff` (write `DIFF.md` vs the previous run), `--screens` (screenshot every live host, camera link in the dashboard), `--depth N` (feroxbuster recursion depth, default 2 — finds nested dirs like /dashboard/functions/), `--uploadpwn "python3 /path/uploadpwn.py -u {url}"` with `--uploadpwn-auto` (intrusive; off by default — upload points are only reported otherwise), `--no-test` (discovery only).
 
 ## Recon Console.html
 

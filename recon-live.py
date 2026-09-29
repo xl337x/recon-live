@@ -34,6 +34,7 @@ ap.add_argument("--max-requests", dest="max_requests", type=int, default=0,
 ap.add_argument("--notify", default="", help="webhook URL POSTed a JSON payload on each high/crit finding")
 ap.add_argument("--diff", action="store_true", help="also write DIFF.md: new hosts/findings vs the previous run of this domain")
 ap.add_argument("--screens", action="store_true", help="capture a screenshot of every live host (httpx -ss, uses system chromium)")
+ap.add_argument("--depth", type=int, default=2, help="feroxbuster recursion depth (1 disables recursion; default 2 finds nested dirs like /dashboard/functions/)")
 ap.set_defaults(test=True)
 A = ap.parse_args()
 A.time_limit = A.time_limit or ("45s" if A.fast else "3m")
@@ -379,9 +380,11 @@ def ferox_host(url, done_ref):
     host = url.replace("https://", "").replace("http://", "").split("/")[0]
     exts = _exts_for(host)
     outp = os.path.join(host_dir(host), "ferox.json")
+    depth = max(1, A.depth)
+    rec = ["-n"] if depth <= 1 else ["-d", str(depth), "--extract-links"]  # recurse + scrape links (autoindex → nested files)
     cmd = [fero, "-u", url, "-w", A.wordlist, "-x", exts, "-t", "40",
-           "-C", "404", "-k", "-n", "-T", "5", "--time-limit", A.time_limit, "--json", "--silent",
-           "--rate-limit", "150", "-o", outp] + HDR_ARGS
+           "-C", "404", "-k", "-T", "5", "--time-limit", A.time_limit, "--json", "--silent",
+           "--rate-limit", "150", "-o", outp] + rec + HDR_ARGS
     tl = _secs(A.time_limit)                      # hard per-host cap, in seconds
     emit({"type": "hoststate", "host": host, "state": "scanning", "pct": 0})
     feed(f"ferox → {host} (exts: {exts})", "info", host)
@@ -624,6 +627,42 @@ def _redirects_to(loc, host):
             return rest == host or rest[:len(host) + 1] in (host + "/", host + ":", host + "?", host + "#")
     return False
 
+AUTOINDEX_RE = _re.compile(rb"<title>\s*Index of\s*/|<h1>\s*Index of\s*/|Directory listing for", _re.I)
+HREF_RE = _re.compile(rb'href=["\']([^"\'>]+)["\']', _re.I)
+def _looks_dataish(body):
+    """Heuristic: does this body carry real data (tables/records/currency/JSON rows)?"""
+    if not body or len(body) < 1200: return False
+    b = body.lower()
+    hits = sum(1 for m in (b"<table", b"&euro;", b"addrows", b'"zusammenfassung', b'":"', b'","',
+                           b"<tr", b"phpsessid", b"<td") if m in b)
+    return hits >= 2
+
+def exposure_checks(url, host):
+    """Catch broken access control the redirect-follower is blind to:
+    (1) a 3xx that STILL returns a data body, (2) autoindex listings + the
+    unauthenticated endpoints they reveal. Pure urllib, no-follow."""
+    sc, hd, body = _get(url, opener=_NOREDIR, timeout=10)
+    # (1) redirect that still ships a real body = classic silent-redirect / auth-bypass leak
+    if sc in (301, 302, 303, 307, 308) and _looks_dataish(body):
+        finding("crit", "access-control", host,
+                f"‼ {sc} redirect still returns a {len(body)}b data body (auth-bypass / silent-redirect leak) — {url}", url)
+    # (2) directory listing / autoindex → flag, then harvest and probe the listed files unauthenticated
+    if body and AUTOINDEX_RE.search(body):
+        finding("high", "dir-listing", host, f"📂 directory listing (autoindex) exposed — {url}", url)
+        base = url if url.endswith("/") else url.rsplit("/", 1)[0] + "/"
+        probed = 0
+        for m in HREF_RE.findall(body):
+            name = m.decode("utf-8", "replace").strip()
+            if not name or name in ("../", "/", "./") or name.startswith(("?", "#", "mailto:")) or "://" in name:
+                continue
+            child = urllib.parse.urljoin(base, name)
+            csc, _, cbody = _get(child, opener=_NOREDIR, timeout=8)
+            if csc in (200, 301, 302) and _looks_dataish(cbody):
+                finding("crit", "unauth-data", host,
+                        f"‼ unauthenticated data at {child} ({len(cbody)}b, {csc}) — no cookie/auth needed", child)
+            probed += 1
+            if probed >= 25: break
+
 def _endpoint_score(url):
     """Cheap attack-surface score from data already gathered (params/dirs/status) —
     used to order the vuln queue so the best endpoints get tested before the cap bites."""
@@ -865,6 +904,25 @@ def stage_intel():
         feed("nuclei -dast: fuzzing discovered parameters (SQLi/XSS/SSTI/LFI/redirect/CRLF via templates)…")
         _nuclei_stream([nuc, "-l", purls, "-dast", "-severity", "low,medium,high,critical",
                         "-jsonl", "-o", os.path.join(OUT, "nuclei_dast.jsonl"), "-silent", "-nc", "-rl", "60"] + HDR_ARGS, "nuclei-dast")
+    # 3) subdomain-takeover sweep (subzy if present, else nuclei takeover templates)
+    subs_all = os.path.join(OUT, "subs.txt")
+    if shutil.which("subzy") and os.path.exists(subs_all):
+        feed("subzy: subdomain-takeover sweep…")
+        def _sz(l):
+            if "VULNERABLE" in l.upper():
+                finding("high", "takeover", _host_of(l), f"subdomain takeover: {l.strip()[:140]}")
+        stream(["subzy", "run", "--targets", subs_all, "--hide_fails"], _sz, key="subzy")
+    elif os.path.exists(subs_all) and os.path.getsize(subs_all):
+        feed("nuclei takeover templates: subdomain-takeover sweep…")
+        _nuclei_stream([nuc, "-l", subs_all, "-tags", "takeover", "-jsonl",
+                        "-o", os.path.join(OUT, "nuclei_takeover.jsonl"), "-silent", "-nc", "-rl", "80"] + HDR_ARGS, "nuclei-takeover")
+    # 4) dalfox XSS confirmation on discovered params (optional — only if installed)
+    if shutil.which("dalfox") and os.path.exists(purls) and os.path.getsize(purls):
+        feed("dalfox: confirming reflected/DOM XSS on discovered params…")
+        def _dx(l):
+            if "[POC]" in l or "[VULN]" in l:
+                finding("high", "xss", _host_of(l), f"dalfox XSS confirmed: {l.strip()[:150]}")
+        stream(["dalfox", "file", purls, "--silence", "--no-color", "--skip-bav"] + HDR_ARGS, _dx, key="dalfox")
     mark_stage("intel")
     emit({"type": "stage", "stage": "intel", "state": "done", "pct": 100})
     feed("nuclei intelligence complete", "good")
@@ -906,6 +964,14 @@ def stage_brain():
                 feed(f"🔌 API/JSON surface on {host} — param/JSON + GraphQL introspection candidate", "info", host)
             # cheap, no-dep scenario tests
             cors_host_checks(url, host)
+            exposure_checks(url, host)               # broken access control / autoindex on the root
+            hd0 = STATE["hosts"].get(host, {})       # + on discovered directories / interesting paths
+            checked = 0
+            for d in hd0.get("dirs", []):
+                p = d.get("path", "")
+                if p and (p.endswith("/") or INTERESTING_PATH.search(p)):
+                    exposure_checks(urllib.parse.urljoin(url, p), host); checked += 1
+                if checked >= 15: break
             tech = " ".join(STATE["hosts"].get(host, {}).get("tech", [])).lower()
             if "wordpress" in tech: run_nuclei_tags(url, host, "wordpress")
             elif "joomla" in tech: run_nuclei_tags(url, host, "joomla")
