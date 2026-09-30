@@ -282,7 +282,7 @@ _FIND_SEEN = set(); _find_lock = threading.Lock()
 # triage — the tool decides what is report-grade (oracle/evidence-confirmed) vs a lead to review
 _CONFIRMED_KINDS = {"sqli", "nosqli", "lfi", "ssti", "xss", "access-control", "unauth-data", "exposed-file",
                     "secret", "open-redirect", "cors", "dir-listing", "takeover", "rce", "host-header",
-                    "header-inj", "auth-bypass", "ssrf", "oob"}
+                    "header-inj", "auth-bypass", "ssrf", "oob", "graphql", "stored-xss"}
 def _triage(kind, sev):
     if kind == "anomaly" or sev in ("low", "info"):
         return "investigate"
@@ -936,6 +936,30 @@ def json_probe(url, host):
             finding("crit", "nosqli", host, f"‼ NoSQL operator auth-bypass — {url}", url)
             return
 
+GQL_PATHS = ["/graphql", "/api/graphql", "/graphql/console", "/v1/graphql", "/query", "/gql",
+             "/graphql.php", "/api/gql", "/subscriptions"]
+def graphql_probe(host, base_url):
+    """Find GraphQL endpoints and test whether introspection is enabled (schema disclosure)."""
+    origin = urllib.parse.urlunsplit(urllib.parse.urlsplit(base_url)[:2] + ("", "", ""))
+    for p in GQL_PATHS:
+        url = origin + p
+        sc, hd, body = _post_json(url, {"query": "query{__schema{queryType{name} types{name kind}}}"})
+        if not body: continue
+        low = body.lower()
+        if b'"__schema"' in low or b'"querytype"' in low:
+            try:
+                n = len(json.loads(body).get("data", {}).get("__schema", {}).get("types", []) or [])
+            except Exception:
+                n = 0
+            finding("high", "graphql", host,
+                    f"‼ GraphQL introspection ENABLED — full schema exposed{f' ({n} types)' if n else ''} at {p} — {url}", url)
+            return
+        if b'"errors"' in low and any(s in low for s in (b"graphql", b"must provide", b"cannot query field",
+                                                          b"syntax error", b"query", b"introspection")):
+            finding("low", "graphql", host,
+                    f"GraphQL endpoint at {p} (introspection disabled — try field-suggestion/known schema) — {url}", url)
+            return
+
 # ---- out-of-band (OOB) testing via interactsh: confirms blind SSRF/RCE/SSTI/XXE by DNS/HTTP callback ----
 _OOB = {"domain": None, "proc": None, "tokens": {}, "lock": threading.Lock(), "n": 0, "on": False}
 
@@ -1055,6 +1079,18 @@ def form_recon(page_url, host):
             r = _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=10)
             if r and r[2] and XSS_MARK.encode() in r[2]:
                 finding("high", "xss", host, f"★ reflected unescaped in form field '{field}' → {action}", action)
+            # stored/persistent XSS: submit a unique marker, then see if it surfaces UNESCAPED in a
+            # FRESH page load that did not carry the payload (distinguishes stored from reflected)
+            st = f"<svg/onload=1>rst{random.randint(10000,99999)}x"
+            data = dict(base); data[field] = st
+            _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=10)
+            origin = urllib.parse.urlunsplit(urllib.parse.urlsplit(action)[:2] + ("", "", ""))
+            for probe in (page_url, action, origin + "/"):
+                r2 = _get(probe, timeout=10)
+                if r2 and r2[2] and st.encode() in r2[2]:
+                    finding("crit", "stored-xss", host,
+                            f"‼ stored/persistent XSS via '{field}' — surfaced unescaped at {probe}", probe)
+                    break
         # auth bypass on login forms: a failed login should stay failed; if an injection flips it
         # to a logged-in state, that's an authentication bypass (SQLi/logic).
         pw = [k for k in form["fields"] if "pass" in k.lower()]
@@ -1543,6 +1579,7 @@ def stage_brain():
                 api = True
                 feed(f"🔌 API/JSON surface on {host} — param/JSON + GraphQL introspection candidate", "info", host)
                 if A.test: json_probe(url, host)     # JSON-body SQLi + NoSQL operator auth-bypass
+            if A.test: graphql_probe(host, url)      # GraphQL endpoint + introspection disclosure
             # cheap, no-dep scenario tests
             cors_host_checks(url, host)
             exposure_checks(url, host)               # broken access control / autoindex on the root
