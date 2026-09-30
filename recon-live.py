@@ -38,6 +38,7 @@ ap.add_argument("--depth", type=int, default=2, help="feroxbuster recursion dept
 ap.add_argument("--ports", action="store_true", help="port-scan resolved hosts (naabu) so httpx probes non-default ports too")
 ap.add_argument("--top-ports", dest="top_ports", type=int, default=100, help="naabu top-ports count (default 100)")
 ap.add_argument("--sqli", action="store_true", help="run sqlmap on the highest-value discovered params (heavy/noisy)")
+ap.add_argument("--no-brute", dest="no_brute", action="store_true", help="skip the resolve-gated common-subdomain brute in enum")
 ap.add_argument("--oob", action="store_true", help="out-of-band testing via interactsh: confirms blind SSRF/RCE/SSTI/XXE by DNS/HTTP callback")
 ap.add_argument("--interactsh-server", dest="interactsh_server", default="", help="self-hosted interactsh server (default: public oast servers)")
 ap.add_argument("--setup", action="store_true", help="install/repair ALL dependencies (go tools + apt + nuclei templates), then exit unless a domain is given")
@@ -325,18 +326,59 @@ def stream(cmd, on_line, key=None):
     return p
 
 # ---------------- pipeline stages ----------------
-def _crtsh(domain):
+def _http_json(url, timeout=20, tries=3):
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": random.choice(UA_POOL)})
+            with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            time.sleep(1 + i)
+    return None
+
+def _http_text(url, timeout=20, tries=2):
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": random.choice(UA_POOL)})
+            with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+                return r.read().decode("utf-8", "replace")
+        except Exception:
+            time.sleep(1 + i)
+    return ""
+
+# free, no-API-key passive subdomain sources (resilient: one failing source never blocks the rest)
+def _src_crtsh(d):
     out = []
-    try:
-        u = "https://crt.sh/?q=%25." + urllib.parse.quote(domain) + "&output=json"
-        req = urllib.request.Request(u, headers={"User-Agent": random.choice(UA_POOL)})
-        with urllib.request.urlopen(req, timeout=25, context=_CTX) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        for row in data:
-            for n in str(row.get("name_value", "")).splitlines():
-                out.append(n)
-    except Exception: pass
+    for row in (_http_json("https://crt.sh/?q=%25." + urllib.parse.quote(d) + "&output=json", tries=3) or []):
+        out += str(row.get("name_value", "")).splitlines()
     return out
+def _src_certspotter(d):
+    out = []
+    for i in (_http_json(f"https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names") or []):
+        out += i.get("dns_names", []) or []
+    return out
+def _src_hackertarget(d):
+    return [l.split(",")[0] for l in _http_text(f"https://api.hackertarget.com/hostsearch/?q={d}").splitlines() if "," in l]
+def _src_otx(d):
+    return [r.get("hostname", "") for r in (_http_json(f"https://otx.alienvault.com/api/v1/indicators/domain/{d}/passive_dns") or {}).get("passive_dns", [])]
+def _src_rapiddns(d):
+    return _re.findall(r'>([A-Za-z0-9_.\-]+\.' + _re.escape(d) + r')<', _http_text(f"https://rapiddns.io/subdomain/{d}?full=1"))
+def _src_alienurls(d):
+    # subdomains hidden in archived URLs (wayback CDX) — a source passive CT logs miss
+    txt = _http_text(f"http://web.archive.org/cdx/search/cdx?url=*.{d}/*&output=text&fl=original&collapse=urlkey&limit=5000")
+    return _re.findall(r'https?://([A-Za-z0-9_.\-]+\.' + _re.escape(d) + r')', txt)
+
+PASSIVE_SRCS = [("crt.sh", _src_crtsh), ("certspotter", _src_certspotter), ("hackertarget", _src_hackertarget),
+                ("otx", _src_otx), ("rapiddns", _src_rapiddns), ("wayback", _src_alienurls)]
+
+# common subdomain prefixes for a light, resolve-gated brute (catches dev/staging/internal that
+# passive sources miss) — only names that actually resolve are kept, so no dead noise
+BRUTE_PREFIXES = ("www","mail","remote","blog","webmail","server","ns1","ns2","smtp","secure","vpn","api",
+    "dev","staging","stage","test","portal","admin","gitlab","git","jenkins","jira","confluence","wiki",
+    "app","apps","mobile","m","shop","store","cdn","static","assets","img","media","docs","support","help",
+    "status","monitor","grafana","kibana","prometheus","dashboard","panel","cpanel","webdisk","autodiscover",
+    "internal","intranet","corp","vpn2","owa","exchange","db","sql","ftp","sftp","proxy","gateway","auth",
+    "sso","login","account","accounts","beta","demo","sandbox","uat","preprod","prod","old","new","backup")
 
 def stage_enum():
     emit({"type": "stage", "stage": "enum", "state": "run"})
@@ -351,15 +393,37 @@ def stage_enum():
             with flock:
                 if l not in found:
                     found.add(l); bump("subs")
-    def crt():
-        names = _crtsh(DOMAIN)
-        for n in names: add(n)
-        if names: feed(f"crt.sh: {len(names)} names", "info")
-    ths = [threading.Thread(target=crt, daemon=True)]
+    def passive(name, fn):
+        try:
+            got = list(fn(DOMAIN))
+        except Exception:
+            got = []
+        kept = 0
+        for n in got:
+            before = len(found); add(n)
+            if len(found) > before: kept += 1
+        if got: feed(f"{name}: {len(got)} names ({kept} new in-scope)", "info")
+    ths = [threading.Thread(target=passive, args=(nm, fn), daemon=True) for nm, fn in PASSIVE_SRCS]
     if shutil.which("subfinder"): ths.append(threading.Thread(target=stream, args=(["subfinder", "-d", DOMAIN, "-all", "-silent"], add), daemon=True))
     if shutil.which("assetfinder"): ths.append(threading.Thread(target=stream, args=(["assetfinder", "--subs-only", DOMAIN], add), daemon=True))
     for t in ths: t.start()
     for t in ths: t.join()
+    # resolve-gated brute: try common prefixes, keep ONLY those that actually resolve (no dead noise).
+    # Skip entirely under wildcard DNS (every prefix would "resolve" to the wildcard = pure noise).
+    if not A.no_brute and not _wildcard_ips():
+        cand = "\n".join(f"{p}.{DOMAIN}" for p in BRUTE_PREFIXES)
+        if shutil.which("dnsx"):
+            bpath = os.path.join(OUT, ".brute_cand.txt"); open(bpath, "w").write(cand + "\n")
+            before = len(found)
+            stream(["dnsx", "-l", bpath, "-silent", "-retry", "2"], add)
+            try: os.remove(bpath)
+            except Exception: pass
+            if len(found) > before: feed(f"brute: +{len(found)-before} resolving common subdomains", "info")
+        else:
+            for p in BRUTE_PREFIXES:                 # stdlib fallback
+                h = f"{p}.{DOMAIN}"
+                try: socket.getaddrinfo(h, None); add(h)
+                except Exception: pass
     # fold www duplicates
     clean = sorted(h for h in found if not (h.startswith("www.") and h[4:] in found))
     open(os.path.join(OUT, "subs.txt"), "w").write("\n".join(clean) + "\n")
