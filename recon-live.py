@@ -813,14 +813,20 @@ def sqli_probe(host, label, sender, do_time=True):
         finding("crit", "sqli", host, f"‼ error-based SQL injection — {label}")
         return True
     if not do_time: return False
-    # 2) time-based blind: baseline fast, SLEEP(6) slow, confirm twice, control SLEEP(0) fast
+    # 2) time-based blind: SLEEP(6) slow vs SLEEP(0) control, confirmed twice with a fast
+    #    control BEFORE and AFTER. Under WAF throttling / congested servers both probes get
+    #    delayed at random, so never trust timing deltas while the baseline itself is unstable.
+    if WAF["tripped"]:
+        return False
     for tpl in SQLI_TIME_TPL[:3]:
         ctrl = _timed_send(sender, tpl.format(s=0))
         slow = _timed_send(sender, tpl.format(s=6))
         if ctrl is None or slow is None: continue
-        if slow - max(ctrl, 0) > 4.5:
+        if ctrl > 4.0: continue                 # unstable baseline — timing tests unreliable here
+        if slow - ctrl > 4.5:
             slow2 = _timed_send(sender, tpl.format(s=6))
-            if slow2 and slow2 - max(ctrl, 0) > 4.5:
+            ctrl2 = _timed_send(sender, tpl.format(s=0))
+            if slow2 and ctrl2 is not None and ctrl2 < 4.0 and slow2 - ctrl2 > 4.5:
                 finding("crit", "sqli", host, f"‼ time-based blind SQL injection — {label} (Δ{slow:.1f}s vs {ctrl:.1f}s)")
                 return True
     return False
